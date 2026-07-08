@@ -1,0 +1,20 @@
+[project]
+name = "redpanda-fde-takehome"
+version = "0.1.0"
+description = "Building a small system that pulls public data, transforms it, runs an agent or reasoning loop over each item, and serves the result."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "ruff>=0.15.14",
+    "ty>=0.0.40",
+]
+
+[tool.ruff.lint]
+select = ["I", "F", "E"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
