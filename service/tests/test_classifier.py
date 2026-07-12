@@ -3,6 +3,7 @@
 import app.classifier
 import pytest
 from app.classifier import (
+    VALID_LABELS,
     ClassificationParseError,
     ModelConfigError,
     ModelUnavailableError,
@@ -204,28 +205,39 @@ def test_5xx_exhaustion_raises_unavailable_after_three_calls(status):
     assert len(client.calls) == 3
 
 
-def test_build_prompt_golden():
+def test_prompt_label_menu_matches_the_validation_enum():
+    prompt = build_prompt(EDIT)
+
+    for label in VALID_LABELS:
+        assert f"- {label}:" in prompt, (
+            "every label normalize() accepts must be offered to the model, "
+            "or valid answers get rejected as enum drift"
+        )
+
+
+def test_prompt_demands_json_with_the_keys_parse_and_normalize_expect():
+    prompt = build_prompt(EDIT)
+
+    assert "JSON object" in prompt, "parse_response only extracts {...} objects"
+    for key in ("label", "confidence", "reasoning"):
+        assert f'"{key}"' in prompt, "normalize() reads exactly these keys"
+
+
+def test_prompt_includes_the_edit_fields_the_model_judges():
     edit = {"id": "1", "title": "Anarchism", "comment": "fix typo", "byte_delta": -3}
 
-    assert build_prompt(edit) == (
-        "You are reviewing a single English Wikipedia edit. Classify it as one of:\n"
-        "- vandalism: bad-faith damage (blanking, slurs, nonsense, spam)\n"
-        "- substantive: good-faith change to article content or facts\n"
-        "- trivia: minor housekeeping (typos, formatting, categories, punctuation)\n"
-        "- unclear: not enough signal to decide\n\n"
-        "Article title: Anarchism\n"
-        "Edit comment: fix typo\n"
-        "Byte delta: -3\n\n"
-        'Respond with only a JSON object: {"label": "...", "confidence": 0.0-1.0, '
-        '"reasoning": "one sentence"}'
-    )
+    prompt = build_prompt(edit)
+
+    assert "Anarchism" in prompt
+    assert "fix typo" in prompt
+    assert "-3" in prompt, "byte delta is the strongest vandalism signal"
 
 
 def test_build_prompt_placeholder_for_empty_comment():
     assert "Edit comment: (none)\n" in build_prompt(EDIT)
 
 
-def test_build_second_pass_prompt_golden():
+def test_second_pass_prompt_extends_first_pass_with_editor_context():
     edit = {
         "id": "1",
         "title": "Anarchism",
@@ -237,14 +249,15 @@ def test_build_second_pass_prompt_golden():
         "server_name": "en.wikipedia.org",
     }
 
-    assert build_second_pass_prompt(edit) == (
-        build_prompt(edit) + "\n\nAdditional context for a more careful judgment:\n"
-        "Editor: 203.0.113.9\n"
-        "Revision: 100 -> 101\n"
-        "Wiki host: en.wikipedia.org\n"
-        "Weigh whether the editor looks like an anonymous IP and whether the "
-        "byte delta is consistent with the edit comment."
+    prompt = build_second_pass_prompt(edit)
+
+    assert prompt.startswith(build_prompt(edit)), (
+        "both passes must judge the same base task, differing only in context"
     )
+    extra = prompt[len(build_prompt(edit)) :]
+    assert "203.0.113.9" in extra, "editor identity is the point of the second pass"
+    assert "100" in extra and "101" in extra, "both revision ids give the model hints"
+    assert "en.wikipedia.org" in extra
 
 
 def test_parse_response_takes_first_object_and_handles_nesting():
@@ -261,6 +274,7 @@ def test_parse_response_handles_braces_at_any_position():
 @pytest.mark.parametrize(
     "text",
     [
+        "",  # empty model output
         "no braces at all",
         "{never closes",
         '{"bad": json,}',

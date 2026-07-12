@@ -215,6 +215,23 @@ def test_numeric_string_attempts_is_coerced_not_parked():
     assert sent.value["attempts"] == 3
 
 
+def test_missing_attempts_field_defaults_to_first_attempt():
+    """Envelope without `attempts` is a first attempt — processed, not parked."""
+    conn, consumer, producer, breaker, log = make_fixtures()
+    client = FakeClient([make_status_error(429)] * 3)
+    envelope = json.loads(make_envelope_message().value)
+    del envelope["attempts"]
+    message = make_message(
+        json.dumps(envelope).encode(), topic=settings.kafka_retry_topic
+    )
+
+    handle_envelope(client, conn, consumer, producer, breaker, message)
+
+    [sent] = producer.sent
+    assert sent.topic == settings.kafka_retry_topic, "must not be parked as malformed"
+    assert sent.value["attempts"] == 2, "missing attempts counts as attempt 1, then +1"
+
+
 def test_schema_mismatch_row_goes_to_dlq_as_malformed():
     import psycopg
 
