@@ -16,14 +16,19 @@ services:
       timeout: 5s
       retries: 12
 
-  # One-shot: create the topic so consumers don't race auto-creation.
+  # One-shot: create the topics so consumers don't race auto-creation.
+  # The DLQ never expires: terminal failure evidence must outlive retention.
   topic-init:
     image: docker.redpanda.com/redpandadata/redpanda:v25.3.15
     depends_on:
       redpanda:
         condition: service_healthy
     entrypoint: ["/bin/sh", "-c"]
-    command: ["rpk topic create wiki.edits.raw -X brokers=redpanda:9092 || true"]
+    command:
+      - |
+        rpk topic create wiki.edits.raw -X brokers=redpanda:9092 || true
+        rpk topic create wiki.edits.retry -X brokers=redpanda:9092 || true
+        rpk topic create wiki.edits.dlq -c retention.ms=-1 -X brokers=redpanda:9092 || true
 
   connect:
     image: docker.redpanda.com/redpandadata/connect:4.99.0
@@ -63,6 +68,27 @@ services:
       ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-haiku-4-5}
       KAFKA_BROKERS: redpanda:9092
       KAFKA_TOPIC: wiki.edits.raw
+      POSTGRES_DSN: postgresql://wiki:wiki@postgres:5432/wiki
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      topic-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Consumes wiki.edits.retry: delayed, bounded re-attempts of transient
+  # failures; exhausted messages promote to wiki.edits.dlq.
+  retrier:
+    build:
+      context: .
+      dockerfile: service/Dockerfile
+    command: ["python", "-m", "app.retrier"]
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-haiku-4-5}
+      KAFKA_BROKERS: redpanda:9092
       POSTGRES_DSN: postgresql://wiki:wiki@postgres:5432/wiki
     depends_on:
       redpanda:

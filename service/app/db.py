@@ -1,5 +1,6 @@
 import logging
 import time
+from collections.abc import Callable
 
 import psycopg
 
@@ -10,15 +11,33 @@ logger = logging.getLogger(__name__)
 
 UPSERT_SQL = """
 INSERT INTO edits (id, title, editor, comment, byte_delta, label, confidence,
-                   reasoning, model, event_time, processed_at)
+                   reasoning, model, status, event_time, processed_at)
 VALUES (%(id)s, %(title)s, %(editor)s, %(comment)s, %(byte_delta)s, %(label)s,
-        %(confidence)s, %(reasoning)s, %(model)s, %(event_time)s, now())
+        %(confidence)s, %(reasoning)s, %(model)s, %(status)s, %(event_time)s, now())
 ON CONFLICT (id) DO UPDATE SET
     label = EXCLUDED.label,
     confidence = EXCLUDED.confidence,
     reasoning = EXCLUDED.reasoning,
     model = EXCLUDED.model,
+    status = EXCLUDED.status,
     processed_at = now()
+"""
+
+# A redelivered/stale failure must never downgrade a row a later (or
+# concurrent) success already classified — hence the status guard.
+FAILED_UPSERT_SQL = """
+INSERT INTO edits (id, title, editor, comment, byte_delta, label, confidence,
+                   reasoning, model, status, event_time, processed_at)
+VALUES (%(id)s, %(title)s, %(editor)s, %(comment)s, %(byte_delta)s, NULL,
+        NULL, %(reasoning)s, NULL, 'failed', %(event_time)s, now())
+ON CONFLICT (id) DO UPDATE SET
+    label = NULL,
+    confidence = NULL,
+    reasoning = EXCLUDED.reasoning,
+    model = NULL,
+    status = 'failed',
+    processed_at = now()
+WHERE edits.status IS DISTINCT FROM 'classified'
 """
 
 
@@ -48,6 +67,38 @@ def upsert_edit(conn: psycopg.Connection, edit: dict, result: Classification) ->
             "confidence": result.confidence,
             "reasoning": result.reasoning,
             "model": result.model,
+            "status": "classified",
             "event_time": edit.get("event_time"),  # already ISO from Bloblang
         },
     )
+
+
+def upsert_failed_edit(
+    conn: psycopg.Connection, edit: dict, reason: str, error: str
+) -> None:
+    """Record failure provenance in the row without touching the label enum."""
+    conn.execute(
+        FAILED_UPSERT_SQL,
+        {
+            "id": str(edit["id"]),
+            "title": edit.get("title"),
+            "editor": edit.get("user"),
+            "comment": edit.get("comment"),
+            "byte_delta": edit.get("byte_delta"),
+            "reasoning": f"failed ({reason}): {error}"[:500],
+            "event_time": edit.get("event_time"),
+        },
+    )
+
+
+def write_with_reconnect(
+    conn: psycopg.Connection, write: Callable[[psycopg.Connection], None]
+) -> psycopg.Connection:
+    """Run a write, reconnecting once if Postgres dropped the connection."""
+    try:
+        write(conn)
+    except psycopg.OperationalError:
+        logger.warning("postgres connection lost, reconnecting")
+        conn = connect()
+        write(conn)
+    return conn

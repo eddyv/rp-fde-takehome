@@ -1,0 +1,258 @@
+"""Always-on retry consumer: wiki.edits.retry -> re-classify -> Postgres or DLQ.
+
+Delay model: each envelope carries `not_before`; the retrier sleeps until it
+(consumer lag eats most of the delay for free — a message already past its
+`not_before` is processed immediately). Per-message time is bounded:
+`not_before` delays cap at settings.retry_backoff_max_seconds (120s) and every
+model call is bounded by the client's 60s request timeout, both well inside
+max_poll_interval_ms (600s); kafka-python heartbeats from a background thread,
+so sleeping in the poll loop is safe. If delays ever needed to approach the
+poll interval, the right tool would be consumer.pause() + periodic poll()
+instead of sleeping.
+
+Outcomes per envelope (same commit-after-publish invariant as the worker):
+- success -> classified row (flips the failed row), commit, breaker resets.
+- ModelConfigError -> SystemExit(1), no commit — never swallowed.
+- ModelUnavailableError -> attempts+1; refreshed failed row; republish to the
+  retry topic with a later not_before, or to the DLQ (`retries_exhausted`)
+  once attempts exceed 1 + max_retry_passes; commit; breaker increments.
+- ClassificationParseError -> refreshed failed row, DLQ (`parse_failed`),
+  commit, breaker resets.
+- Undecodable/invalid envelope (our own bug), or an edit whose data does not
+  fit the schema -> DLQ as malformed, commit.
+"""
+
+import json
+import logging
+import time
+from datetime import UTC, datetime
+
+import anthropic
+import psycopg
+from kafka import KafkaConsumer
+from kafka.errors import KafkaError
+
+from app import db, failures
+from app.classifier import (
+    ClassificationParseError,
+    ModelConfigError,
+    ModelUnavailableError,
+    classify,
+)
+from app.config import settings
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+MAX_POLL_INTERVAL_MS = 600_000
+SLEEP_CHUNK_SECONDS = 5
+
+
+def make_consumer(retries: int = 30, delay: float = 2.0) -> KafkaConsumer:
+    for attempt in range(retries):
+        try:
+            return KafkaConsumer(
+                settings.kafka_retry_topic,
+                bootstrap_servers=settings.kafka_brokers.split(","),
+                group_id=settings.retrier_consumer_group,
+                enable_auto_commit=False,
+                auto_offset_reset="earliest",
+                max_poll_interval_ms=MAX_POLL_INTERVAL_MS,
+            )
+        except KafkaError as error:  # broker not up yet at stack boot
+            if attempt == retries - 1:
+                raise
+            logger.info("kafka not ready (%s), retrying...", type(error).__name__)
+            time.sleep(delay)
+    raise RuntimeError("unreachable")
+
+
+def _now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _parse_not_before(value) -> datetime | None:
+    """None passes through; naive timestamps are assumed UTC; junk raises
+    TypeError/ValueError (validated at decode time, tolerated in wait_until)."""
+    if value is None:
+        return None
+    target = datetime.fromisoformat(value)
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=UTC)
+    return target
+
+
+def wait_until(not_before) -> None:
+    """Sleep until the envelope's earliest-retry time; no-op if already past.
+
+    Chunked sleeps keep each pause well under max_poll_interval_ms and make
+    the loop responsive to clock re-checks.
+    """
+    try:
+        target = _parse_not_before(not_before)
+    except (TypeError, ValueError):
+        return  # unparseable timestamp: retry immediately rather than wedge
+    if target is None:
+        return
+    while True:
+        remaining = (target - _now()).total_seconds()
+        if remaining <= 0:
+            return
+        time.sleep(min(remaining, SLEEP_CHUNK_SECONDS))
+
+
+def handle_envelope(client, conn, consumer, producer, breaker, message):
+    """Process one retry envelope; returns the (possibly reconnected) conn."""
+    try:
+        envelope = json.loads(message.value)
+        edit = envelope["edit"]
+        if not isinstance(edit, dict) or edit.get("id") is None:
+            raise TypeError(f"not an edit object: {type(edit).__name__}")
+        attempts = int(envelope.get("attempts", 1))
+        _parse_not_before(envelope.get("not_before"))  # validate before use
+    except (
+        json.JSONDecodeError,
+        UnicodeDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as error:
+        # An envelope we can't decode/validate is a bug in this service; park
+        # the evidence rather than crash-loop on it.
+        logger.error("invalid retry envelope at offset %s -> DLQ", message.offset)
+        failures.park_malformed(producer, consumer, message, error, source="retrier")
+        return conn
+
+    try:
+        return _handle_edit(
+            client, conn, consumer, producer, breaker, message, envelope, edit, attempts
+        )
+    except psycopg.OperationalError:
+        raise  # connection-level failure even after reconnect: crash, redeliver
+    except psycopg.Error as error:
+        # Data-shaped failure (edit values don't fit the schema): retrying
+        # the same envelope can never succeed, so park it and move on.
+        logger.warning(
+            "edit %s does not fit the schema -> DLQ: %s", edit.get("id"), error
+        )
+        failures.park_malformed(producer, consumer, message, error, source="retrier")
+        return conn
+
+
+def _handle_edit(
+    client, conn, consumer, producer, breaker, message, envelope, edit, attempts
+):
+    wait_until(envelope.get("not_before"))
+    first_failed_at = envelope.get("first_failed_at")
+
+    try:
+        result = classify(client, edit)
+    except ModelConfigError as error:
+        logger.critical(
+            "deterministic model failure (bad key/config?), crashing: %s", error
+        )
+        raise SystemExit(1) from error
+    except ModelUnavailableError as error:
+        error_text = str(error)  # `error` is unbound once the except block exits
+        attempts += 1
+        conn = db.write_with_reconnect(
+            conn,
+            lambda c: db.upsert_failed_edit(
+                c, edit, failures.REASON_TRANSIENT_EXHAUSTED, error_text
+            ),
+        )
+        # attempts counts the worker's first pass plus each retrier pass.
+        if attempts >= 1 + settings.max_retry_passes:
+            logger.warning(
+                "edit %s exhausted %d attempts -> DLQ", edit.get("id"), attempts
+            )
+            out = failures.make_envelope(
+                reason=failures.REASON_RETRIES_EXHAUSTED,
+                error=error_text,
+                source="retrier",
+                message=message,
+                edit=edit,
+                attempts=attempts,
+                first_failed_at=first_failed_at,
+            )
+            failures.publish(producer, settings.kafka_dlq_topic, out)
+        else:
+            out = failures.make_envelope(
+                reason=failures.REASON_TRANSIENT_EXHAUSTED,
+                error=error_text,
+                source="retrier",
+                message=message,
+                edit=edit,
+                attempts=attempts,
+                first_failed_at=first_failed_at,
+                not_before=failures.next_not_before(attempts),
+            )
+            failures.publish(producer, settings.kafka_retry_topic, out)
+        consumer.commit()
+        if breaker.record_failure():
+            logger.critical(
+                "circuit breaker tripped after %d consecutive transient failures; "
+                "crashing so restart backoff becomes the half-open probe",
+                breaker.threshold,
+            )
+            raise SystemExit(1)
+        return conn
+    except ClassificationParseError as error:
+        error_text = str(error)
+        logger.warning("unusable model output for edit %s -> DLQ", edit.get("id"))
+        conn = db.write_with_reconnect(
+            conn,
+            lambda c: db.upsert_failed_edit(
+                c, edit, failures.REASON_PARSE_FAILED, error_text
+            ),
+        )
+        out = failures.make_envelope(
+            reason=failures.REASON_PARSE_FAILED,
+            error=error_text,
+            source="retrier",
+            message=message,
+            edit=edit,
+            attempts=attempts,
+            first_failed_at=first_failed_at,
+        )
+        failures.publish(producer, settings.kafka_dlq_topic, out)
+        consumer.commit()
+        breaker.record_success()  # the API is reachable; only the output was bad
+        return conn
+
+    conn = db.write_with_reconnect(conn, lambda c: db.upsert_edit(c, edit, result))
+    consumer.commit()
+    breaker.record_success()
+    logger.info(
+        "retried edit %s -> %s (%.2f) after %d attempts",
+        edit.get("id"),
+        result.label,
+        result.confidence,
+        attempts,
+    )
+    return conn
+
+
+def main() -> None:
+    # SDK retries are disabled: this service owns retry/backoff (classifier.py).
+    # The explicit request timeout (SDK default is 600s) keeps one hung call
+    # from blowing past max_poll_interval_ms and evicting us from the group.
+    client = anthropic.Anthropic(
+        api_key=settings.anthropic_api_key.get_secret_value(),
+        max_retries=0,
+        timeout=60.0,
+    )
+    conn = db.connect()
+    consumer = make_consumer()
+    producer = failures.make_producer()
+    breaker = failures.CircuitBreaker(settings.breaker_threshold)
+    logger.info(
+        "consuming %s from %s", settings.kafka_retry_topic, settings.kafka_brokers
+    )
+
+    for message in consumer:
+        conn = handle_envelope(client, conn, consumer, producer, breaker, message)
+
+
+if __name__ == "__main__":
+    main()

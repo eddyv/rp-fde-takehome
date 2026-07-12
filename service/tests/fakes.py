@@ -1,0 +1,91 @@
+"""Shared test doubles: no network, no broker, no Postgres.
+
+FakeClient replays scripted model outputs; items may be strings (returned as
+a text block) or Exception instances (raised from create()), so tests can
+script real SDK errors built by make_status_error().
+"""
+
+from types import SimpleNamespace
+
+import anthropic
+import httpx
+
+
+def make_status_error(status_code: int) -> anthropic.APIStatusError:
+    """Build a real SDK error backed by an httpx.Response, as the SDK would."""
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    response = httpx.Response(
+        status_code, request=request, json={"error": {"message": f"http {status_code}"}}
+    )
+    if status_code == 429:
+        return anthropic.RateLimitError(
+            f"http {status_code}", response=response, body=None
+        )
+    return anthropic.APIStatusError(f"http {status_code}", response=response, body=None)
+
+
+class FakeClient:
+    """Stands in for anthropic.Anthropic; replays scripted outputs."""
+
+    def __init__(self, outputs: list):
+        self.calls: list[str] = []  # prompt contents, in order
+        self.kwargs: list[dict] = []  # full create() kwargs, in order
+        self._outputs = list(outputs)
+        self.messages = self
+
+    def create(self, **kwargs) -> SimpleNamespace:
+        self.calls.append(kwargs["messages"][0]["content"])
+        self.kwargs.append(kwargs)
+        item = self._outputs.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return SimpleNamespace(content=[SimpleNamespace(type="text", text=item)])
+
+
+class FakeFuture:
+    def get(self, timeout=None) -> SimpleNamespace:
+        return SimpleNamespace(topic="t", partition=0, offset=0)
+
+
+class FakeProducer:
+    """Records sends; shares an event log with FakeConsumer to pin ordering."""
+
+    def __init__(self, log: list | None = None):
+        self.sent: list[SimpleNamespace] = []
+        self.log = log if log is not None else []
+
+    def send(self, topic, value=None, key=None) -> FakeFuture:
+        self.sent.append(SimpleNamespace(topic=topic, value=value, key=key))
+        self.log.append(("publish", topic))
+        return FakeFuture()
+
+
+class FakeConsumer:
+    def __init__(self, log: list | None = None):
+        self.commits = 0
+        self.log = log if log is not None else []
+
+    def commit(self, offsets=None) -> None:
+        self.commits += 1
+        self.log.append(("commit",))
+
+
+class FakeConn:
+    """Records SQL; shares the ordering log; optionally raises on execute."""
+
+    def __init__(self, log: list | None = None, fail_with: Exception | None = None):
+        self.executed: list[tuple[str, dict]] = []
+        self.log = log if log is not None else []
+        self.fail_with = fail_with
+
+    def execute(self, sql, params=None) -> None:
+        if self.fail_with is not None:
+            raise self.fail_with
+        self.executed.append((sql, params))
+        self.log.append(("db",))
+
+
+def make_message(
+    value: bytes, topic: str = "wiki.edits.raw", partition: int = 0, offset: int = 7
+) -> SimpleNamespace:
+    return SimpleNamespace(topic=topic, partition=partition, offset=offset, value=value)

@@ -1,0 +1,183 @@
+"""handle_message routing: per-class destinations, commit ordering, breaker."""
+
+import base64
+import json
+
+import psycopg
+import pytest
+from app import failures
+from app.config import settings
+from app.worker import handle_message
+
+from tests.fakes import (
+    FakeClient,
+    FakeConn,
+    FakeConsumer,
+    FakeProducer,
+    make_message,
+    make_status_error,
+)
+
+EDIT = {"id": "1", "title": "X", "comment": "", "byte_delta": 5}
+GOOD_JSON = '{"label": "vandalism", "confidence": 0.9, "reasoning": "blanked"}'
+
+
+def make_fixtures(threshold: int = 25):
+    log: list = []
+    return (
+        FakeConn(log),
+        FakeConsumer(log),
+        FakeProducer(log),
+        failures.CircuitBreaker(threshold),
+        log,
+    )
+
+
+def test_malformed_message_goes_to_dlq_then_commits():
+    conn, consumer, producer, breaker, log = make_fixtures()
+    message = make_message(b"not json")
+
+    handle_message(FakeClient([]), conn, consumer, producer, breaker, message)
+
+    [sent] = producer.sent
+    assert sent.topic == settings.kafka_dlq_topic
+    assert sent.value["reason"] == "malformed"
+    assert sent.key is None, "no edit id is known for undecodable payloads"
+    assert base64.b64decode(sent.value["raw"]) == b"not json"
+    assert log == [("publish", settings.kafka_dlq_topic), ("commit",)]
+    assert conn.executed == [], "nothing classifiable, nothing written"
+
+
+def test_json_scalar_message_is_malformed_not_a_crash():
+    conn, consumer, producer, breaker, log = make_fixtures()
+    message = make_message(b"5")  # valid JSON, but not an edit object
+
+    handle_message(FakeClient([]), conn, consumer, producer, breaker, message)
+
+    [sent] = producer.sent
+    assert sent.topic == settings.kafka_dlq_topic
+    assert sent.value["reason"] == "malformed"
+    assert consumer.commits == 1
+
+
+def test_object_without_id_is_malformed_not_a_crash():
+    conn, consumer, producer, breaker, log = make_fixtures()
+    message = make_message(b"{}")  # valid JSON object, but no usable edit id
+
+    handle_message(FakeClient([]), conn, consumer, producer, breaker, message)
+
+    [sent] = producer.sent
+    assert sent.topic == settings.kafka_dlq_topic
+    assert sent.value["reason"] == "malformed"
+    assert consumer.commits == 1
+    assert conn.executed == []
+
+
+def test_schema_mismatch_row_goes_to_dlq_as_malformed():
+    # e.g. byte_delta that isn't an int: psycopg raises a DataError (not
+    # OperationalError) — retrying can never help, so park + commit.
+    log: list = []
+    conn = FakeConn(log, fail_with=psycopg.DataError("invalid input for type integer"))
+    consumer, producer = FakeConsumer(log), FakeProducer(log)
+    breaker = failures.CircuitBreaker(25)
+    message = make_message(json.dumps(EDIT).encode())
+
+    handle_message(FakeClient([GOOD_JSON]), conn, consumer, producer, breaker, message)
+
+    [sent] = producer.sent
+    assert sent.topic == settings.kafka_dlq_topic
+    assert sent.value["reason"] == "malformed"
+    assert consumer.commits == 1
+
+
+def test_transient_exhaustion_failed_row_then_retry_publish_then_commit():
+    conn, consumer, producer, breaker, log = make_fixtures()
+    client = FakeClient([make_status_error(429)] * 3)
+    message = make_message(json.dumps(EDIT).encode())
+
+    handle_message(client, conn, consumer, producer, breaker, message)
+
+    [(sql, params)] = conn.executed
+    assert "status IS DISTINCT FROM 'classified'" in sql
+    assert params["reasoning"].startswith("failed (transient_exhausted)")
+    [sent] = producer.sent
+    assert sent.topic == settings.kafka_retry_topic
+    assert sent.key == b"1", "envelope key must be the edit id"
+    assert sent.value["attempts"] == 1
+    assert sent.value["edit"] == EDIT
+    assert "not_before" in sent.value
+    assert log == [("db",), ("publish", settings.kafka_retry_topic), ("commit",)]
+    assert breaker.consecutive_failures == 1
+
+
+def test_breaker_trips_on_nth_consecutive_transient_after_commit():
+    conn, consumer, producer, breaker, log = make_fixtures(threshold=2)
+    message = make_message(json.dumps(EDIT).encode())
+
+    handle_message(
+        FakeClient([make_status_error(429)] * 3),
+        conn,
+        consumer,
+        producer,
+        breaker,
+        message,
+    )
+    with pytest.raises(SystemExit):
+        handle_message(
+            FakeClient([make_status_error(429)] * 3),
+            conn,
+            consumer,
+            producer,
+            breaker,
+            message,
+        )
+
+    assert consumer.commits == 2, "breaker crash must happen after the commit"
+    assert len(producer.sent) == 2, "the tripping message still reaches the retry topic"
+
+
+def test_config_error_crashes_without_commit_or_publish():
+    conn, consumer, producer, breaker, log = make_fixtures()
+    client = FakeClient([make_status_error(401)])
+    message = make_message(json.dumps(EDIT).encode())
+
+    with pytest.raises(SystemExit):
+        handle_message(client, conn, consumer, producer, breaker, message)
+
+    assert consumer.commits == 0, "the offset must stay put for redelivery"
+    assert producer.sent == []
+    assert conn.executed == []
+
+
+def test_parse_failure_failed_row_then_dlq_and_breaker_reset():
+    conn, consumer, producer, breaker, log = make_fixtures()
+    breaker.record_failure()  # pre-existing transient streak
+    client = FakeClient(["no json", "still no json"])
+    message = make_message(json.dumps(EDIT).encode())
+
+    handle_message(client, conn, consumer, producer, breaker, message)
+
+    [(sql, params)] = conn.executed
+    assert params["reasoning"].startswith("failed (parse_failed)")
+    [sent] = producer.sent
+    assert sent.topic == settings.kafka_dlq_topic
+    assert sent.key == b"1", "envelope key must be the edit id"
+    assert sent.value["reason"] == "parse_failed"
+    assert log == [("db",), ("publish", settings.kafka_dlq_topic), ("commit",)]
+    assert breaker.consecutive_failures == 0, "parse failure proves the API is up"
+
+
+def test_success_upserts_classified_and_resets_breaker():
+    conn, consumer, producer, breaker, log = make_fixtures()
+    breaker.record_failure()
+    client = FakeClient([GOOD_JSON])
+    message = make_message(json.dumps(EDIT).encode())
+
+    handle_message(client, conn, consumer, producer, breaker, message)
+
+    [(sql, params)] = conn.executed
+    assert params["status"] == "classified"
+    assert params["label"] == "vandalism"
+    assert producer.sent == []
+    assert log == [("db",), ("commit",)]
+    assert breaker.consecutive_failures == 0
