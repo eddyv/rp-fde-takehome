@@ -11,3 +11,6 @@ wheels/
 
 # Secrets
 .env
+
+# mutmut mutation-testing artifacts (service/mutants/)
+mutants/

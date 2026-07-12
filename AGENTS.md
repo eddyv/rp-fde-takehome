@@ -10,10 +10,11 @@ width = 5 # good
 
 This project is configured with pytest, mutmut, coverage. All changes you make should have a related test for it.
 For evaluations, use deepeval.
+For mutation testing, use mutmut.
 
 ## Documentation
 
-README.md — must copy-pasteable run instructions, the Tradeoffs section (Leave empty, for the user to complete), surprises, production-failure notes
+README.md — must contain copy-pasteable run instructions, the Tradeoffs section (Leave empty, for the user to complete), surprises, production-failure notes
 
 ## Hints
 
