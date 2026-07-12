@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 import anthropic
 
-from app.config import ANTHROPIC_MODEL, CONFIDENCE_THRESHOLD
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +75,7 @@ def call_model(client: anthropic.Anthropic, prompt: str) -> str:
     for attempt in range(MAX_CALL_ATTEMPTS):
         try:
             response = client.messages.create(
-                model=ANTHROPIC_MODEL,
+                model=settings.anthropic_model,
                 max_tokens=256,
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -131,7 +131,7 @@ def normalize(parsed: dict) -> Classification | None:
         confidence = 0.0
     confidence = min(max(confidence, 0.0), 1.0)
     reasoning = str(parsed.get("reasoning", "")).strip()
-    return Classification(label, confidence, reasoning, ANTHROPIC_MODEL)
+    return Classification(label, confidence, reasoning, settings.anthropic_model)
 
 
 def _attempt(client: anthropic.Anthropic, prompt: str) -> Classification | None:
@@ -160,7 +160,7 @@ def classify(client: anthropic.Anthropic, edit: dict) -> Classification:
     if result is None:
         return fallback()
 
-    if result.confidence < CONFIDENCE_THRESHOLD:
+    if result.confidence < settings.confidence_threshold:
         try:
             second = _attempt(client, build_second_pass_prompt(edit))
         except ModelCallError as error:
@@ -177,5 +177,5 @@ def fallback() -> Classification:
         label="unclear",
         confidence=0.1,
         reasoning="fallback: model output could not be parsed or call failed",
-        model=ANTHROPIC_MODEL,
+        model=settings.anthropic_model,
     )

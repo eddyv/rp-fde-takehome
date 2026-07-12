@@ -15,7 +15,7 @@ from kafka.errors import KafkaError
 
 from app import db
 from app.classifier import classify
-from app.config import CONSUMER_GROUP, KAFKA_BROKERS, KAFKA_TOPIC
+from app.config import settings
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -25,9 +25,9 @@ def make_consumer(retries: int = 30, delay: float = 2.0) -> KafkaConsumer:
     for attempt in range(retries):
         try:
             return KafkaConsumer(
-                KAFKA_TOPIC,
-                bootstrap_servers=KAFKA_BROKERS.split(","),
-                group_id=CONSUMER_GROUP,
+                settings.kafka_topic,
+                bootstrap_servers=settings.kafka_brokers.split(","),
+                group_id=settings.consumer_group,
                 enable_auto_commit=False,
                 auto_offset_reset="earliest",
             )
@@ -41,10 +41,12 @@ def make_consumer(retries: int = 30, delay: float = 2.0) -> KafkaConsumer:
 
 def main() -> None:
     # SDK retries are disabled: this service owns retry/backoff (classifier.py).
-    client = anthropic.Anthropic(max_retries=0)
+    client = anthropic.Anthropic(
+        api_key=settings.anthropic_api_key.get_secret_value(), max_retries=0
+    )
     conn = db.connect()
     consumer = make_consumer()
-    logger.info("consuming %s from %s", KAFKA_TOPIC, KAFKA_BROKERS)
+    logger.info("consuming %s from %s", settings.kafka_topic, settings.kafka_brokers)
 
     for message in consumer:
         try:

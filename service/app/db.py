@@ -4,7 +4,7 @@ import time
 import psycopg
 
 from app.classifier import Classification
-from app.config import POSTGRES_DSN
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,7 @@ def connect(retries: int = 30, delay: float = 2.0) -> psycopg.Connection:
     """Postgres may still be warming up when the worker starts."""
     for attempt in range(retries):
         try:
-            return psycopg.connect(POSTGRES_DSN, autocommit=True)
+            return psycopg.connect(settings.postgres_dsn, autocommit=True)
         except psycopg.OperationalError as error:
             if attempt == retries - 1:
                 raise

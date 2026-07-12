@@ -4,7 +4,7 @@ import psycopg
 from fastapi import FastAPI, HTTPException, Query
 from psycopg.rows import dict_row
 
-from app.config import POSTGRES_DSN
+from app.config import settings
 
 app = FastAPI(title="wiki-edits")
 
@@ -29,5 +29,5 @@ def get_edits(
     query += " ORDER BY processed_at DESC LIMIT %s"
     params.append(limit)
 
-    with psycopg.connect(POSTGRES_DSN, row_factory=dict_row) as conn:
+    with psycopg.connect(settings.postgres_dsn, row_factory=dict_row) as conn:
         return conn.execute(query, params).fetchall()
