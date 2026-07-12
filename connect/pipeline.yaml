@@ -1,0 +1,64 @@
+# Plumbing only: SSE ingest -> filter -> project -> publish to wiki.edits.raw.
+# No LLM calls here; classification happens in the reasoning service.
+
+input:
+  http_client:
+    url: https://stream.wikimedia.org/v2/stream/recentchange
+    verb: GET
+    headers:
+      # Wikimedia 403s anonymous clients — identify ourselves.
+      User-Agent: redpanda-fde-takehome/0.1 (vaismanedward@gmail.com)
+    stream:
+      enabled: true
+      scanner:
+        lines: {}
+
+pipeline:
+  processors:
+    # SSE frames arrive one line at a time: "event: message", "data: {...}",
+    # ":ok" heartbeats, and blank lines. Keep only data lines that parse as
+    # JSON — .catch(deleted()) drops heartbeats/partial lines instead of
+    # letting a raw string leak downstream (Bloblang doesn't fail-closed
+    # inside `if`).
+    - mapping: |
+        root = if content().string().has_prefix("data: ") {
+          content().string().trim_prefix("data: ").parse_json().catch(deleted())
+        } else {
+          deleted()
+        }
+
+    # Aggressive filter before the topic: English Wikipedia articles only,
+    # human edits only. Each assignment reads full root so nothing is lost.
+    - mapping: |
+        root = this
+        root = if this.wiki != "enwiki" { deleted() }
+        root = if this.namespace != 0 { deleted() }
+        root = if this.type != "edit" { deleted() }
+        root = if this.bot == true { deleted() }
+
+    # Project to the small schema the service consumes. Single block rebuilds
+    # root deliberately — no trailing mappings after this.
+    - mapping: |
+        root = {}
+        # int64 first: bare .string() on a parsed JSON number renders float64
+        # scientific notation ("2.04e+09") for large rc ids.
+        root.id = this.id.int64().string()
+        root.title = this.title
+        root.user = this.user
+        root.comment = this.comment.or("")
+        # Wikipedia timestamps are epoch seconds; Postgres TIMESTAMPTZ rejects
+        # raw epochs, so format to ISO here.
+        root.event_time = this.timestamp.ts_format("2006-01-02T15:04:05Z07:00", "UTC").catch(null)
+        root.byte_delta = (this.length.new - this.length.old).catch(0)
+        root.rev_new = this.revision.new.catch(null)
+        root.rev_old = this.revision.old.catch(null)
+        root.server_name = this.server_name
+
+output:
+  redpanda:
+    seed_brokers: ["redpanda:9092"]
+    topic: wiki.edits.raw
+    key: ${! json("id") }
+    # kafka-python can't decode snappy (franz-go's default) without an extra
+    # C library; the filtered stream is low-volume so plain is fine.
+    compression: none

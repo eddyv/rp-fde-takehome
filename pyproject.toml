@@ -1,13 +1,23 @@
 [project]
 name = "redpanda-fde-takehome"
 version = "0.1.0"
-description = "Building a small system that pulls public data, transforms it, runs an agent or reasoning loop over each item, and serves the result."
+description = "Workspace root for the wiki-edits pipeline; the deployable service lives in service/."
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "reasoning-service",
+]
+
+[tool.uv.workspace]
+members = ["service"]
+
+[tool.uv.sources]
+reasoning-service = { workspace = true }
 
 [dependency-groups]
 dev = [
+    "deepeval==4.0.7",
+    "mutmut>=3.6.0",
     "pytest>=9.0.3",
     "ruff>=0.15.14",
     "ty>=0.0.40",
@@ -17,4 +27,4 @@ dev = [
 select = ["I", "F", "E"]
 
 [tool.pytest.ini_options]
-pythonpath = ["."]
+testpaths = ["service/tests"]
