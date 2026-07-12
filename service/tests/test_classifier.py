@@ -1,14 +1,20 @@
 """Classifier taxonomy and parse-path tests; no network (see tests.fakes)."""
 
+import app.classifier
 import pytest
 from app.classifier import (
     ClassificationParseError,
     ModelConfigError,
     ModelUnavailableError,
+    build_prompt,
+    build_second_pass_prompt,
     classify,
+    normalize,
+    parse_response,
 )
+from app.config import settings
 
-from tests.fakes import FakeClient, make_status_error
+from tests.fakes import FakeClient, make_block, make_status_error
 
 EDIT = {"id": "1", "title": "X", "comment": "", "byte_delta": 5}
 GOOD_JSON = '{"label": "trivia", "confidence": 0.9, "reasoning": "typo fix"}'
@@ -22,11 +28,15 @@ def test_malformed_output_retries_once_then_raises_parse_error():
         ]
     )
 
-    with pytest.raises(ClassificationParseError):
+    # The error must name the edit so DLQ provenance stays useful.
+    with pytest.raises(ClassificationParseError, match="edit 1"):
         classify(client, EDIT)
 
     assert len(client.calls) == 2, "expected exactly one retry after parse failure"
-    assert "ONLY the JSON" in client.calls[1], "retry should tighten the format ask"
+    assert client.calls[0] == build_prompt(EDIT)
+    assert client.calls[1] == (
+        build_prompt(EDIT) + "\n\nReturn ONLY the JSON object, nothing else."
+    ), "retry must be the same prompt with only the format reminder appended"
 
 
 def test_retry_recovers_when_second_output_is_dirty_but_parseable():
@@ -44,13 +54,14 @@ def test_retry_recovers_when_second_output_is_dirty_but_parseable():
 
     assert result.label == "vandalism"  # extracted from prose, trimmed, lowercased
     assert result.confidence == 0.9
+    assert result.model == settings.anthropic_model, "retry keeps the same model"
     assert len(client.calls) == 2
 
 
 def test_missing_api_key_typeerror_is_config_error():
     client = FakeClient([TypeError("Could not resolve authentication method")])
 
-    with pytest.raises(ModelConfigError):
+    with pytest.raises(ModelConfigError, match="authentication"):
         classify(client, EDIT)
 
     assert len(client.calls) == 1, "deterministic failure must not be retried"
@@ -59,19 +70,52 @@ def test_missing_api_key_typeerror_is_config_error():
 def test_401_is_config_error_after_exactly_one_call():
     client = FakeClient([make_status_error(401)])
 
-    with pytest.raises(ModelConfigError):
+    with pytest.raises(ModelConfigError, match="http 401"):
         classify(client, EDIT)
 
     assert len(client.calls) == 1, "4xx must not be retried"
 
 
-def test_rate_limit_exhaustion_raises_unavailable_after_three_calls():
+def test_rate_limit_exhaustion_raises_unavailable_after_three_calls(monkeypatch):
+    sleeps: list = []
+    monkeypatch.setattr(app.classifier.time, "sleep", lambda s: sleeps.append(s))
     client = FakeClient([make_status_error(429)] * 3)
 
-    with pytest.raises(ModelUnavailableError):
+    # The message must carry the last upstream error for the failed row/DLQ.
+    with pytest.raises(ModelUnavailableError, match="http 429"):
         classify(client, EDIT)
 
     assert len(client.calls) == 3
+    assert sleeps == [1, 2], "backoff between attempts, none after the last"
+
+
+def test_request_shape_is_single_user_message_with_bounded_tokens():
+    client = FakeClient([GOOD_JSON])
+
+    classify(client, EDIT)
+
+    [kwargs] = client.kwargs
+    assert kwargs["model"] == settings.anthropic_model
+    assert kwargs["max_tokens"] == 256
+    assert kwargs["messages"] == [{"role": "user", "content": build_prompt(EDIT)}]
+
+
+def test_non_text_blocks_are_ignored_and_text_blocks_concatenated():
+    client = FakeClient(
+        [
+            [
+                make_block("thinking", "NOT JSON {{{"),
+                make_block("text", '{"label": "trivia", "confidence'),
+                make_block("text", '": 0.9, "reasoning": "typo fix"}'),
+            ]
+        ]
+    )
+
+    result = classify(client, EDIT)
+
+    assert result.label == "trivia"
+    assert result.confidence == 0.9
+    assert len(client.calls) == 1, "the joined text blocks must parse first try"
 
 
 @pytest.mark.parametrize("status", [500, 408, 409])
@@ -110,3 +154,159 @@ def test_model_override_lands_in_classification():
 
     assert result.model == "claude-sonnet-4-5"
     assert client.kwargs[0]["model"] == "claude-sonnet-4-5"
+
+
+def test_low_confidence_triggers_second_pass_and_its_answer_wins():
+    low = '{"label": "unclear", "confidence": 0.3, "reasoning": "meh"}'
+    high = '{"label": "substantive", "confidence": 0.85, "reasoning": "adds facts"}'
+    client = FakeClient([low, high])
+
+    result = classify(client, EDIT)
+
+    assert result.label == "substantive", "the second pass saw more context"
+    assert result.confidence == 0.85
+    assert result.reasoning == "adds facts"
+    assert client.calls[1] == build_second_pass_prompt(EDIT)
+    assert client.kwargs[1]["model"] == settings.anthropic_model
+
+
+def test_confidence_at_threshold_skips_second_pass():
+    at_threshold = (
+        f'{{"label": "trivia", "confidence": {settings.confidence_threshold}, '
+        '"reasoning": "ok"}'
+    )
+    client = FakeClient([at_threshold])
+
+    result = classify(client, EDIT)
+
+    assert result.confidence == settings.confidence_threshold
+    assert len(client.calls) == 1, "second pass is for strictly-below only"
+
+
+def test_second_pass_unusable_output_keeps_first_result():
+    low = '{"label": "unclear", "confidence": 0.3, "reasoning": "meh"}'
+    client = FakeClient([low, "no json here"])
+
+    result = classify(client, EDIT)
+
+    assert result.label == "unclear"
+    assert result.confidence == 0.3
+    assert len(client.calls) == 2, "second pass is single-shot, no format retry"
+
+
+@pytest.mark.parametrize("status", [500, 502, 503])
+def test_5xx_exhaustion_raises_unavailable_after_three_calls(status):
+    client = FakeClient([make_status_error(status)] * 3)
+
+    with pytest.raises(ModelUnavailableError, match=f"http {status}"):
+        classify(client, EDIT)
+
+    assert len(client.calls) == 3
+
+
+def test_build_prompt_golden():
+    edit = {"id": "1", "title": "Anarchism", "comment": "fix typo", "byte_delta": -3}
+
+    assert build_prompt(edit) == (
+        "You are reviewing a single English Wikipedia edit. Classify it as one of:\n"
+        "- vandalism: bad-faith damage (blanking, slurs, nonsense, spam)\n"
+        "- substantive: good-faith change to article content or facts\n"
+        "- trivia: minor housekeeping (typos, formatting, categories, punctuation)\n"
+        "- unclear: not enough signal to decide\n\n"
+        "Article title: Anarchism\n"
+        "Edit comment: fix typo\n"
+        "Byte delta: -3\n\n"
+        'Respond with only a JSON object: {"label": "...", "confidence": 0.0-1.0, '
+        '"reasoning": "one sentence"}'
+    )
+
+
+def test_build_prompt_placeholder_for_empty_comment():
+    assert "Edit comment: (none)\n" in build_prompt(EDIT)
+
+
+def test_build_second_pass_prompt_golden():
+    edit = {
+        "id": "1",
+        "title": "Anarchism",
+        "comment": "fix typo",
+        "byte_delta": -3,
+        "user": "203.0.113.9",
+        "rev_old": 100,
+        "rev_new": 101,
+        "server_name": "en.wikipedia.org",
+    }
+
+    assert build_second_pass_prompt(edit) == (
+        build_prompt(edit) + "\n\nAdditional context for a more careful judgment:\n"
+        "Editor: 203.0.113.9\n"
+        "Revision: 100 -> 101\n"
+        "Wiki host: en.wikipedia.org\n"
+        "Weigh whether the editor looks like an anonymous IP and whether the "
+        "byte delta is consistent with the edit comment."
+    )
+
+
+def test_parse_response_takes_first_object_and_handles_nesting():
+    assert parse_response('pre {"a": {"b": 1}} post {"c": 2}') == {"a": {"b": 1}}
+
+
+def test_parse_response_handles_braces_at_any_position():
+    assert parse_response('{"a": 1}') == {"a": 1}
+    assert parse_response('x{"a": 1}') == {"a": 1}, "object starting at index 1"
+    assert parse_response('{"a": 1}x tail') == {"a": 1}, "text right after the brace"
+    assert parse_response('} {"a": 1}') == {"a": 1}, "stray brace before the object"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "no braces at all",
+        "{never closes",
+        '{"bad": json,}',
+        "[1, 2, 3]",  # JSON but not an object
+        'the answer is ["x"] ok',
+    ],
+)
+def test_parse_response_rejects_unusable_output(text):
+    assert parse_response(text) is None
+
+
+def test_normalize_trims_and_lowercases_label_and_reasoning():
+    result = normalize(
+        {"label": " Vandalism ", "confidence": 0.7, "reasoning": "  blanked  "},
+        "m",
+    )
+
+    assert result.label == "vandalism"
+    assert result.confidence == 0.7
+    assert result.reasoning == "blanked"
+    assert result.model == "m"
+
+
+def test_normalize_rejects_labels_outside_the_enum():
+    assert normalize({"label": "spammy", "confidence": 0.9}, "m") is None
+    assert normalize({"confidence": 0.9}, "m") is None
+
+
+@pytest.mark.parametrize(
+    ("raw_confidence", "expected"),
+    [
+        (1.5, 1.0),  # clamped down
+        (-0.5, 0.0),  # clamped up
+        ("0.4", 0.4),  # numeric string coerced
+        ("high", 0.0),  # junk floors, never inflates
+        (None, 0.0),
+        ("__missing__", 0.0),  # absent key floors too
+    ],
+)
+def test_normalize_clamps_and_floors_confidence(raw_confidence, expected):
+    parsed = {"label": "trivia", "reasoning": "r"}
+    if raw_confidence != "__missing__":
+        parsed["confidence"] = raw_confidence
+
+    assert normalize(parsed, "m").confidence == expected
+
+
+def test_normalize_defaults_missing_reasoning_to_empty_string():
+    assert normalize({"label": "trivia", "confidence": 0.9}, "m").reasoning == ""

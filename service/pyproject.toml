@@ -12,12 +12,20 @@ dependencies = [
     "pydantic-settings==2.14.2",
 ]
 
+# Without an explicit testpaths, a bare `pytest` from this directory also
+# collects mutmut's mutants/tests copy and dies on an import mismatch.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 # Mutation testing. Run from this directory (service/): `uv run mutmut run`.
 # mutmut matches mutants to tests by module name, so source_paths must be the
 # importable package root ("app"), not "service/app" from the workspace root.
 [tool.mutmut]
 source_paths = ["app"]
 pytest_add_cli_args_test_selection = ["tests"]
+do_not_mutate_patterns = [
+    "logger\\.\\w+",  # Ignores all logger.info/debug/warning statements
+]
 
 [build-system]
 requires = ["hatchling"]

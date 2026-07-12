@@ -63,9 +63,12 @@ def test_transient_republish_increments_attempts_and_preserves_first_failed():
     [sent] = producer.sent
     assert sent.topic == settings.kafka_retry_topic
     assert sent.key == b"9", "envelope key must be the edit id"
+    assert sent.value["reason"] == "transient_exhausted"
+    assert sent.value["error"] == "http 429"
     assert sent.value["attempts"] == 2
     assert sent.value["first_failed_at"] == FIRST_FAILED
     assert sent.value["source"] == "retrier"
+    assert sent.value["edit"] == EDIT
     # New not_before is computed from now, not from the stale envelope.
     delay = (
         datetime.fromisoformat(sent.value["not_before"]) - datetime.now(UTC)
@@ -73,6 +76,7 @@ def test_transient_republish_increments_attempts_and_preserves_first_failed():
     assert 50 <= delay <= 61, "attempt 2 should be scheduled ~60s out"
     [(sql, params)] = conn.executed
     assert params["reasoning"].startswith("failed (transient_exhausted)")
+    assert "http 429" in params["reasoning"], "the row carries the upstream error"
     assert log == [("db",), ("publish", settings.kafka_retry_topic), ("commit",)]
     assert breaker.consecutive_failures == 1
 
@@ -88,6 +92,9 @@ def test_exhausted_attempts_promote_to_dlq():
     assert sent.topic == settings.kafka_dlq_topic
     assert sent.key == b"9", "envelope key must be the edit id"
     assert sent.value["reason"] == "retries_exhausted"
+    assert sent.value["source"] == "retrier"
+    assert sent.value["error"] == "http 429"
+    assert sent.value["edit"] == EDIT
     assert sent.value["attempts"] == settings.max_retry_passes + 1
     assert sent.value["first_failed_at"] == FIRST_FAILED
     assert "not_before" not in sent.value, "DLQ envelopes carry no schedule"
@@ -120,8 +127,15 @@ def test_parse_failure_goes_to_dlq_and_resets_breaker():
 
     [sent] = producer.sent
     assert sent.topic == settings.kafka_dlq_topic
+    assert sent.key == b"9", "envelope key must be the edit id"
     assert sent.value["reason"] == "parse_failed"
+    assert sent.value["source"] == "retrier"
+    assert sent.value["attempts"] == 2, "parse failure preserves the attempt count"
+    assert "unusable" in sent.value["error"]
     assert sent.value["first_failed_at"] == FIRST_FAILED
+    [(sql, params)] = conn.executed
+    assert params["reasoning"].startswith("failed (parse_failed)")
+    assert "unusable" in params["reasoning"], "the row carries the actual error"
     assert consumer.commits == 1
     assert breaker.consecutive_failures == 0
 
@@ -131,11 +145,25 @@ def test_config_error_crashes_without_commit_or_publish():
     client = FakeClient([make_status_error(401)])
     message = make_envelope_message()
 
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as excinfo:
         handle_envelope(client, conn, consumer, producer, breaker, message)
 
+    assert excinfo.value.code == 1, "must read as a failure to the restart policy"
     assert consumer.commits == 0
     assert producer.sent == []
+
+
+def test_breaker_trips_after_commit_with_failure_exit_code():
+    conn, consumer, producer, breaker, log = make_fixtures(threshold=1)
+    client = FakeClient([make_status_error(429)] * 3)
+    message = make_envelope_message(attempts=1)
+
+    with pytest.raises(SystemExit) as excinfo:
+        handle_envelope(client, conn, consumer, producer, breaker, message)
+
+    assert excinfo.value.code == 1, "must read as a failure to the restart policy"
+    assert consumer.commits == 1, "breaker crash must happen after the commit"
+    assert len(producer.sent) == 1, "the tripping envelope still republishes"
 
 
 def test_undecodable_envelope_goes_to_dlq_as_malformed():
@@ -201,7 +229,20 @@ def test_schema_mismatch_row_goes_to_dlq_as_malformed():
     [sent] = producer.sent
     assert sent.topic == settings.kafka_dlq_topic
     assert sent.value["reason"] == "malformed"
+    assert sent.value["source"] == "retrier"
+    assert "invalid input" in sent.value["error"]
     assert consumer.commits == 1
+
+
+def test_non_object_edit_error_names_the_offending_type():
+    conn, consumer, producer, breaker, log = make_fixtures()
+    message = make_envelope_message(edit="5")
+
+    handle_envelope(FakeClient([]), conn, consumer, producer, breaker, message)
+
+    [sent] = producer.sent
+    assert sent.value["error"] == "not an edit object: str"
+    assert sent.value["source"] == "retrier"
 
 
 def test_wait_until_past_timestamp_does_not_sleep(monkeypatch):
@@ -228,6 +269,55 @@ def test_wait_until_sleeps_in_chunks_of_at_most_five_seconds(monkeypatch):
     monkeypatch.setattr(retrier, "_now", lambda: clock["now"])
     monkeypatch.setattr(retrier.time, "sleep", fake_sleep)
 
-    wait_until((start + timedelta(seconds=12)).isoformat())
+    wait_until((start + timedelta(seconds=11)).isoformat())
 
-    assert sleeps == [5, 5, 2]
+    assert sleeps == [5, 5, 1], "the final sub-second-chunk must still be slept"
+
+
+def test_wait_until_treats_naive_future_timestamp_as_utc(monkeypatch):
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    clock = {"now": start}
+    sleeps: list = []
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        clock["now"] += timedelta(seconds=seconds)
+
+    monkeypatch.setattr(retrier, "_now", lambda: clock["now"])
+    monkeypatch.setattr(retrier.time, "sleep", fake_sleep)
+
+    # No tzinfo on the timestamp: still a real schedule, not an instant pass.
+    wait_until("2026-01-01T00:00:04")
+
+    assert sleeps == [4]
+
+
+def test_handle_envelope_waits_for_not_before_then_classifies(monkeypatch):
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    clock = {"now": start}
+    events: list = []
+
+    def fake_sleep(seconds):
+        events.append(("sleep", seconds))
+        clock["now"] += timedelta(seconds=seconds)
+
+    monkeypatch.setattr(retrier, "_now", lambda: clock["now"])
+    monkeypatch.setattr(retrier.time, "sleep", fake_sleep)
+
+    conn, consumer, producer, breaker, log = make_fixtures()
+
+    class EventClient(FakeClient):
+        def create(self, **kwargs):
+            events.append(("classify",))
+            return super().create(**kwargs)
+
+    client = EventClient([GOOD_JSON])
+    message = make_envelope_message(
+        not_before=(start + timedelta(seconds=7)).isoformat()
+    )
+
+    handle_envelope(client, conn, consumer, producer, breaker, message)
+
+    assert events == [("sleep", 5), ("sleep", 2), ("classify",)], (
+        "the envelope's schedule must be honored before calling the model"
+    )

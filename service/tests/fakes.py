@@ -24,8 +24,18 @@ def make_status_error(status_code: int) -> anthropic.APIStatusError:
     return anthropic.APIStatusError(f"http {status_code}", response=response, body=None)
 
 
+def make_block(block_type: str, text: str) -> SimpleNamespace:
+    """A response content block, for scripting multi-block model replies."""
+    return SimpleNamespace(type=block_type, text=text)
+
+
 class FakeClient:
-    """Stands in for anthropic.Anthropic; replays scripted outputs."""
+    """Stands in for anthropic.Anthropic; replays scripted outputs.
+
+    Each output may be a string (one text block), an Exception (raised from
+    create()), or a list of blocks built with make_block() for responses
+    that mix text and non-text content.
+    """
 
     def __init__(self, outputs: list):
         self.calls: list[str] = []  # prompt contents, in order
@@ -39,11 +49,17 @@ class FakeClient:
         item = self._outputs.pop(0)
         if isinstance(item, Exception):
             raise item
+        if isinstance(item, list):
+            return SimpleNamespace(content=item)
         return SimpleNamespace(content=[SimpleNamespace(type="text", text=item)])
 
 
 class FakeFuture:
+    def __init__(self):
+        self.get_timeout = None  # records the ack-wait bound passed to get()
+
     def get(self, timeout=None) -> SimpleNamespace:
+        self.get_timeout = timeout
         return SimpleNamespace(topic="t", partition=0, offset=0)
 
 
@@ -55,9 +71,12 @@ class FakeProducer:
         self.log = log if log is not None else []
 
     def send(self, topic, value=None, key=None) -> FakeFuture:
-        self.sent.append(SimpleNamespace(topic=topic, value=value, key=key))
+        future = FakeFuture()
+        self.sent.append(
+            SimpleNamespace(topic=topic, value=value, key=key, future=future)
+        )
         self.log.append(("publish", topic))
-        return FakeFuture()
+        return future
 
 
 class FakeConsumer:

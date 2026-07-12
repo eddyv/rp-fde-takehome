@@ -2,6 +2,7 @@
 
 import base64
 import json
+from datetime import UTC, datetime
 
 import psycopg
 import pytest
@@ -42,6 +43,8 @@ def test_malformed_message_goes_to_dlq_then_commits():
     [sent] = producer.sent
     assert sent.topic == settings.kafka_dlq_topic
     assert sent.value["reason"] == "malformed"
+    assert sent.value["source"] == "worker"
+    assert "Expecting value" in sent.value["error"], "decode error is the evidence"
     assert sent.key is None, "no edit id is known for undecodable payloads"
     assert base64.b64decode(sent.value["raw"]) == b"not json"
     assert log == [("publish", settings.kafka_dlq_topic), ("commit",)]
@@ -57,6 +60,7 @@ def test_json_scalar_message_is_malformed_not_a_crash():
     [sent] = producer.sent
     assert sent.topic == settings.kafka_dlq_topic
     assert sent.value["reason"] == "malformed"
+    assert sent.value["error"] == "not an edit object: int"
     assert consumer.commits == 1
 
 
@@ -69,6 +73,7 @@ def test_object_without_id_is_malformed_not_a_crash():
     [sent] = producer.sent
     assert sent.topic == settings.kafka_dlq_topic
     assert sent.value["reason"] == "malformed"
+    assert sent.value["error"] == "not an edit object: dict"
     assert consumer.commits == 1
     assert conn.executed == []
 
@@ -87,6 +92,8 @@ def test_schema_mismatch_row_goes_to_dlq_as_malformed():
     [sent] = producer.sent
     assert sent.topic == settings.kafka_dlq_topic
     assert sent.value["reason"] == "malformed"
+    assert sent.value["source"] == "worker"
+    assert "invalid input" in sent.value["error"]
     assert consumer.commits == 1
 
 
@@ -100,12 +107,20 @@ def test_transient_exhaustion_failed_row_then_retry_publish_then_commit():
     [(sql, params)] = conn.executed
     assert "status IS DISTINCT FROM 'classified'" in sql
     assert params["reasoning"].startswith("failed (transient_exhausted)")
+    assert "http 429" in params["reasoning"], "the row carries the upstream error"
     [sent] = producer.sent
     assert sent.topic == settings.kafka_retry_topic
     assert sent.key == b"1", "envelope key must be the edit id"
+    assert sent.value["reason"] == "transient_exhausted"
+    assert sent.value["source"] == "worker"
+    assert sent.value["error"] == "http 429"
     assert sent.value["attempts"] == 1
     assert sent.value["edit"] == EDIT
-    assert "not_before" in sent.value
+    # First retry is scheduled one base-backoff out, computed from now.
+    delay = (
+        datetime.fromisoformat(sent.value["not_before"]) - datetime.now(UTC)
+    ).total_seconds()
+    assert 25 <= delay <= settings.retry_backoff_base_seconds
     assert log == [("db",), ("publish", settings.kafka_retry_topic), ("commit",)]
     assert breaker.consecutive_failures == 1
 
@@ -122,7 +137,7 @@ def test_breaker_trips_on_nth_consecutive_transient_after_commit():
         breaker,
         message,
     )
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as excinfo:
         handle_message(
             FakeClient([make_status_error(429)] * 3),
             conn,
@@ -132,6 +147,7 @@ def test_breaker_trips_on_nth_consecutive_transient_after_commit():
             message,
         )
 
+    assert excinfo.value.code == 1, "must read as a failure to the restart policy"
     assert consumer.commits == 2, "breaker crash must happen after the commit"
     assert len(producer.sent) == 2, "the tripping message still reaches the retry topic"
 
@@ -141,9 +157,10 @@ def test_config_error_crashes_without_commit_or_publish():
     client = FakeClient([make_status_error(401)])
     message = make_message(json.dumps(EDIT).encode())
 
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as excinfo:
         handle_message(client, conn, consumer, producer, breaker, message)
 
+    assert excinfo.value.code == 1, "must read as a failure to the restart policy"
     assert consumer.commits == 0, "the offset must stay put for redelivery"
     assert producer.sent == []
     assert conn.executed == []
@@ -159,10 +176,15 @@ def test_parse_failure_failed_row_then_dlq_and_breaker_reset():
 
     [(sql, params)] = conn.executed
     assert params["reasoning"].startswith("failed (parse_failed)")
+    assert "unusable" in params["reasoning"], "the row carries the actual error"
     [sent] = producer.sent
     assert sent.topic == settings.kafka_dlq_topic
     assert sent.key == b"1", "envelope key must be the edit id"
     assert sent.value["reason"] == "parse_failed"
+    assert sent.value["source"] == "worker"
+    assert sent.value["attempts"] == 1
+    assert "unusable" in sent.value["error"]
+    assert "not_before" not in sent.value, "DLQ envelopes carry no schedule"
     assert log == [("db",), ("publish", settings.kafka_dlq_topic), ("commit",)]
     assert breaker.consecutive_failures == 0, "parse failure proves the API is up"
 
