@@ -65,6 +65,15 @@ Run the tests (no network, no Docker needed):
 uv run pytest
 ```
 
+Integration tests are opt-in: the first spins up real Redpanda + Postgres via
+testcontainers (Docker required), the second runs end-to-end against a local
+Ollama:
+
+```sh
+uv run pytest -m "integration and not llm"
+uv run pytest -m llm
+```
+
 Lint / format:
 
 ```sh

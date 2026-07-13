@@ -18,6 +18,8 @@ services:
 
   # One-shot: create the topics so consumers don't race auto-creation.
   # The DLQ never expires: terminal failure evidence must outlive retention.
+  # rpk exits 1 for an existing topic, so tolerate only TOPIC_ALREADY_EXISTS
+  # and fail the container on any other error ($$ = compose escaping).
   topic-init:
     image: docker.redpanda.com/redpandadata/redpanda:v25.3.15
     depends_on:
@@ -26,9 +28,15 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        rpk topic create wiki.edits.raw -X brokers=redpanda:9092 || true
-        rpk topic create wiki.edits.retry -X brokers=redpanda:9092 || true
-        rpk topic create wiki.edits.dlq -c retention.ms=-1 -X brokers=redpanda:9092 || true
+        create() {
+          out=$$(rpk topic create "$$@" -X brokers=redpanda:9092 2>&1) ||
+            echo "$$out" | grep -q TOPIC_ALREADY_EXISTS ||
+            { echo "$$out" >&2; exit 1; }
+          echo "$$out"
+        }
+        create wiki.edits.raw
+        create wiki.edits.retry
+        create wiki.edits.dlq -c retention.ms=-1
 
   connect:
     image: docker.redpanda.com/redpandadata/connect:4.99.0
@@ -66,6 +74,13 @@ services:
     environment:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-haiku-4-5}
+      # Empty-string env values break the service (the SDK treats base_url=""
+      # as a real URL; pydantic rejects "" for numbers), so default to the
+      # SDK's own endpoint and config.py's values instead of passing blanks.
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-https://api.anthropic.com}
+      CONFIDENCE_THRESHOLD: ${CONFIDENCE_THRESHOLD:-0.6}
+      BREAKER_THRESHOLD: ${BREAKER_THRESHOLD:-25}
+      MAX_RETRY_PASSES: ${MAX_RETRY_PASSES:-3}
       KAFKA_BROKERS: redpanda:9092
       KAFKA_TOPIC: wiki.edits.raw
       POSTGRES_DSN: postgresql://wiki:wiki@postgres:5432/wiki
@@ -88,6 +103,10 @@ services:
     environment:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-haiku-4-5}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-https://api.anthropic.com}
+      CONFIDENCE_THRESHOLD: ${CONFIDENCE_THRESHOLD:-0.6}
+      BREAKER_THRESHOLD: ${BREAKER_THRESHOLD:-25}
+      MAX_RETRY_PASSES: ${MAX_RETRY_PASSES:-3}
       KAFKA_BROKERS: redpanda:9092
       POSTGRES_DSN: postgresql://wiki:wiki@postgres:5432/wiki
     depends_on:
