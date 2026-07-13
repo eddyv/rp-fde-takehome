@@ -272,6 +272,70 @@ def read_envelopes(
         consumer.close()
 
 
+def read_records(topic: str, expected_count: int, timeout: float = POLL_TIMEOUT_SECONDS):
+    """Read up to `expected_count` raw ConsumerRecords from `topic` (fresh
+    reader group, from the beginning), polling until the count is reached or
+    the deadline passes.
+
+    Unlike `read_envelopes`, this does NOT rely on the poll-once-more shortcut
+    (which stops after the first record plus one extra 1s poll) and it hands
+    back the records themselves -- with `.offset` and raw `.value` -- so callers
+    can reason about broker positions. The sweeper drain needs both: several
+    envelopes at once, and where they sit relative to the snapshot boundary.
+    Single-partition topics (the harness default) yield records in offset order.
+    """
+    consumer = KafkaConsumer(
+        topic,
+        bootstrap_servers=settings.kafka_brokers.split(","),
+        group_id=f"test-reader-{uuid.uuid4().hex[:8]}",
+        enable_auto_commit=False,
+        auto_offset_reset="earliest",
+    )
+    try:
+        records = []
+        deadline = time.monotonic() + timeout
+        while len(records) < expected_count and time.monotonic() < deadline:
+            for batch in consumer.poll(timeout_ms=1000).values():
+                records.extend(batch)
+        return records
+    finally:
+        consumer.close()
+
+
+def end_offset(topic: str, partition: int = 0) -> int:
+    """The current high-water (end) offset for one partition -- i.e. the
+    snapshot boundary the sweeper takes at start. Uses `assign` (not
+    `subscribe`) so there is no group rebalance to wait on."""
+    consumer = KafkaConsumer(
+        bootstrap_servers=settings.kafka_brokers.split(","),
+        group_id=f"test-reader-{uuid.uuid4().hex[:8]}",
+        enable_auto_commit=False,
+    )
+    try:
+        tp = TopicPartition(topic, partition)
+        consumer.assign([tp])
+        return consumer.end_offsets([tp])[tp]
+    finally:
+        consumer.close()
+
+
+def committed_offset(group_id: str, topic: str, partition: int = 0):
+    """The broker-side committed offset for `group_id` on one partition, read
+    with a throwaway consumer that assigns the partition directly. Returns None
+    if the group has never committed."""
+    consumer = KafkaConsumer(
+        bootstrap_servers=settings.kafka_brokers.split(","),
+        group_id=group_id,
+        enable_auto_commit=False,
+    )
+    try:
+        tp = TopicPartition(topic, partition)
+        consumer.assign([tp])
+        return consumer.committed(tp)
+    finally:
+        consumer.close()
+
+
 def run_worker_once(client):
     """Build real collaborators from production factories, process exactly
     one message from `settings.kafka_topic`, and report what happened."""
