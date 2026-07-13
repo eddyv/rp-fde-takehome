@@ -48,7 +48,7 @@ REDPANDA_IMAGE = "docker.redpanda.com/redpandadata/redpanda:v25.3.15"
 OLLAMA_IMAGE = "ollama/ollama:0.31.2"
 OLLAMA_MIN_VERSION = (0, 12)
 
-OLLAMA_MODEL = os.environ.get("OLLAMA_TEST_MODEL", "gpt-oss:20b")
+OLLAMA_MODEL = os.environ.get("OLLAMA_TEST_MODEL", "llama3.2:1b")
 
 POLL_TIMEOUT_SECONDS = 30
 
