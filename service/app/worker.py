@@ -2,7 +2,9 @@
 
 At-least-once: offsets are committed only after the row is written (and, for
 failures, after the retry/DLQ envelope is broker-acked), so redelivery is the
-worst case and loss is impossible. The UPSERT makes redelivery idempotent.
+worst case and loss is impossible. The UPSERT makes redelivery idempotent, and
+a status pre-check skips the LLM for an already-classified redelivered id
+('failed' and absent rows still classify).
 
 Per-class routing (see classifier.py for the taxonomy):
 - ModelConfigError    -> CRITICAL + SystemExit(1), no commit: a visible crash
@@ -98,6 +100,17 @@ def handle_message(client, conn, consumer, producer, breaker, message):
 
 
 def _handle_edit(client, conn, consumer, producer, breaker, message, edit):
+    # Redelivery pre-check: an already-classified row means the verdict is
+    # durable, so re-running classify() would only re-burn its model calls.
+    # A 'failed' row must NOT skip — a redelivery is its retry — and
+    # an absent row is first delivery. A Postgres outage here propagates as
+    # OperationalError (crash uncommitted), same as the write paths.
+    conn, status = db.read_with_reconnect(conn, lambda c: db.fetch_edit_status(c, edit))
+    if status == "classified":
+        logger.info("edit %s already classified, skipping redelivery", edit.get("id"))
+        consumer.commit()
+        return conn
+
     try:
         result = classify(client, edit)
     except ModelConfigError as error:

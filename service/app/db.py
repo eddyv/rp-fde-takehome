@@ -40,6 +40,8 @@ ON CONFLICT (id) DO UPDATE SET
 WHERE edits.status IS DISTINCT FROM 'classified'
 """
 
+STATUS_SQL = "SELECT status FROM edits WHERE id = %(id)s"
+
 
 def connect(retries: int = 30, delay: float = 2.0) -> psycopg.Connection:
     """Postgres may still be warming up when the worker starts."""
@@ -85,10 +87,18 @@ def upsert_failed_edit(
             "editor": edit.get("user"),
             "comment": edit.get("comment"),
             "byte_delta": edit.get("byte_delta"),
+            # The column is unbounded TEXT; the cap only bounds the
+            # operator-facing provenance an upstream error can dump into it.
             "reasoning": f"failed ({reason}): {error}"[:500],
             "event_time": edit.get("event_time"),
         },
     )
+
+
+def fetch_edit_status(conn: psycopg.Connection, edit: dict) -> str | None:
+    """Status of the edit's row, or None when no row exists yet."""
+    row = conn.execute(STATUS_SQL, {"id": str(edit["id"])}).fetchone()
+    return row[0] if row is not None else None
 
 
 def write_with_reconnect(
@@ -102,3 +112,15 @@ def write_with_reconnect(
         conn = connect()
         write(conn)
     return conn
+
+
+def read_with_reconnect[T](
+    conn: psycopg.Connection, read: Callable[[psycopg.Connection], T]
+) -> tuple[psycopg.Connection, T]:
+    """Run a read, reconnecting once if Postgres dropped the connection."""
+    try:
+        return conn, read(conn)
+    except psycopg.OperationalError:
+        logger.warning("postgres connection lost, reconnecting")
+        conn = connect()
+        return conn, read(conn)

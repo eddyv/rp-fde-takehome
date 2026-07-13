@@ -204,6 +204,21 @@ def test_invalid_envelope_fields_go_to_dlq_as_malformed(overrides):
     assert consumer.commits == 1
 
 
+def test_unexpected_envelope_schema_version_goes_to_dlq_as_malformed():
+    conn, consumer, producer, breaker, log = make_fixtures()
+    client = FakeClient([])  # any classify call would blow up the fake
+    message = make_envelope_message(schema=2)
+
+    handle_envelope(client, conn, consumer, producer, breaker, message)
+
+    [sent] = producer.sent
+    assert sent.topic == settings.kafka_dlq_topic
+    assert sent.value["reason"] == "malformed"
+    assert sent.value["error"] == "unsupported envelope schema: 2"
+    assert client.calls == [], "unknown versions must be parked before classify"
+    assert consumer.commits == 1
+
+
 def test_numeric_string_attempts_is_coerced_not_parked():
     conn, consumer, producer, breaker, log = make_fixtures()
     client = FakeClient([make_status_error(429)] * 3)

@@ -189,6 +189,39 @@ def test_parse_failure_failed_row_then_dlq_and_breaker_reset():
     assert breaker.consecutive_failures == 0, "parse failure proves the API is up"
 
 
+def test_already_classified_redelivery_skips_the_llm_and_commits():
+    log: list = []
+    conn = FakeConn(log, statuses={"1": "classified"})
+    consumer, producer = FakeConsumer(log), FakeProducer(log)
+    breaker = failures.CircuitBreaker(25)
+    client = FakeClient([])  # any classify call would blow up the fake
+    message = make_message(json.dumps(EDIT).encode())
+
+    handle_message(client, conn, consumer, producer, breaker, message)
+
+    assert client.calls == [], "an already-classified id must not re-burn the LLM"
+    assert conn.status_reads == ["1"]
+    assert conn.executed == [], "the durable row must stay untouched"
+    assert producer.sent == []
+    assert log == [("commit",)], "the offset must still be committed"
+
+
+def test_failed_status_redelivery_still_reclassifies():
+    log: list = []
+    conn = FakeConn(log, statuses={"1": "failed"})
+    consumer, producer = FakeConsumer(log), FakeProducer(log)
+    breaker = failures.CircuitBreaker(25)
+    client = FakeClient([GOOD_JSON])
+    message = make_message(json.dumps(EDIT).encode())
+
+    handle_message(client, conn, consumer, producer, breaker, message)
+
+    assert len(client.calls) == 1, "a 'failed' row must reclassify, never skip"
+    [(sql, params)] = conn.executed
+    assert params["status"] == "classified"
+    assert log == [("db",), ("commit",)]
+
+
 def test_success_upserts_classified_and_resets_breaker():
     conn, consumer, producer, breaker, log = make_fixtures()
     breaker.record_failure()

@@ -102,6 +102,9 @@ def main() -> None:
 
         try:
             envelope = json.loads(message.value)
+            schema = envelope.get("schema")
+            if schema != failures.ENVELOPE_SCHEMA:
+                raise ValueError(f"unsupported envelope schema: {schema!r}")
             reason = envelope.get("reason")
             attempts = int(envelope.get("attempts", 1))
         except (

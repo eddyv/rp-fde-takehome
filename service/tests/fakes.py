@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import anthropic
 import httpx
+from app import db
 
 
 def make_status_error(status_code: int) -> anthropic.APIStatusError:
@@ -101,14 +102,36 @@ class FakeConsumer:
 
 
 class FakeConn:
-    """Records SQL; shares the ordering log; optionally raises on execute."""
+    """Records SQL; shares the ordering log; optionally raises on execute.
 
-    def __init__(self, log: list | None = None, fail_with: Exception | None = None):
+    `statuses` maps edit ids to row statuses for the worker's redelivery
+    pre-check; ids not present read as an absent row. Status reads land in
+    `status_reads`, not `executed`/`log` (the log pins the ordering of side
+    effects, which a read is not), and they bypass `fail_with` so failure
+    injection keeps hitting the write even though the pre-check runs first.
+    """
+
+    def __init__(
+        self,
+        log: list | None = None,
+        fail_with: Exception | None = None,
+        statuses: dict[str, str] | None = None,
+    ):
         self.executed: list[tuple[str, dict]] = []
+        self.status_reads: list[str] = []
         self.log = log if log is not None else []
         self.fail_with = fail_with
+        self.statuses = statuses if statuses is not None else {}
 
-    def execute(self, sql, params=None) -> None:
+    def execute(self, sql, params=None):
+        if sql is db.STATUS_SQL:
+            self.status_reads.append(params["id"])
+            row = (
+                (self.statuses[params["id"]],)
+                if params["id"] in self.statuses
+                else None
+            )
+            return SimpleNamespace(fetchone=lambda: row)
         if self.fail_with is not None:
             raise self.fail_with
         self.executed.append((sql, params))

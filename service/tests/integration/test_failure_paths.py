@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from app import db
+from app.classifier import Classification
 from app.config import settings
 
 from tests.fakes import FakeClient, make_status_error
@@ -33,11 +34,13 @@ FULL_EDIT = {
 }
 
 
-def test_worker_happy_path_writes_full_row_and_is_idempotent(pg_conn):
+def test_worker_happy_path_writes_full_row_and_skips_classified_redelivery(pg_conn):
     """The success path over the real broker without the LLM: every column is
     mapped (note editor <- user), the offset is committed, and a redelivery of
-    the identical edit leaves exactly one row -- the UPSERT idempotency the
-    worker docstring promises for at-least-once delivery."""
+    the identical edit takes the status pre-check's skip path -- no model call,
+    no row rewrite, offset still committed. The UPSERT idempotency the worker
+    docstring promises is pinned separately at the SQL boundary below, since
+    the pre-check now hides it from a real redelivery."""
     produce(settings.kafka_topic, json.dumps(FULL_EDIT).encode())
 
     message, committed = run_worker_once(FakeClient([GOOD_JSON]))
@@ -58,28 +61,45 @@ def test_worker_happy_path_writes_full_row_and_is_idempotent(pg_conn):
     assert row["event_time"] == datetime(2026, 7, 1, tzinfo=UTC)
     first_processed_at = row["processed_at"]
 
-    # Redeliver the identical edit: the UPSERT must collapse it onto one row.
+    # Redeliver the identical edit: the pre-classify status lookup must skip
+    # the LLM (zero calls on a fresh fake) and just commit the offset, leaving
+    # the row -- including processed_at -- untouched.
     produce(settings.kafka_topic, json.dumps(FULL_EDIT).encode())
-    message2, committed2 = run_worker_once(FakeClient([GOOD_JSON]))
+    client2 = FakeClient([GOOD_JSON])  # a classify call would consume this
+    message2, committed2 = run_worker_once(client2)
 
     assert committed2 is not None and committed2 == message2.offset + 1
-    # The redelivery must have taken the SUCCESS path -- not been parked to the
-    # DLQ. If UPSERT_SQL lost its ON CONFLICT clause (or regressed to DO
-    # NOTHING), the second write would raise UniqueViolation, which the worker
-    # catches as psycopg.Error and routes to park_malformed -> DLQ, leaving the
-    # existing row untouched. Row count alone can't tell those worlds apart (the
-    # failed INSERT writes no row either), so pin the success path directly: the
-    # row's processed_at must advance, which only the ON CONFLICT DO UPDATE re-
-    # running a second time can do -- while still collapsing onto exactly one row.
+    assert client2.calls == [], (
+        "an already-classified redelivery must not re-burn the LLM"
+    )
     row2 = pg_conn.execute(
         "SELECT * FROM edits WHERE id = %s", (FULL_EDIT["id"],)
     ).fetchone()
-    assert row2["processed_at"] > first_processed_at, (
-        "the UPSERT must have re-run on redelivery (success path), not been parked"
+    assert row2["processed_at"] == first_processed_at, (
+        "the skip path must not rewrite the row"
     )
-    assert (
-        pg_conn.execute("SELECT count(*) AS n FROM edits").fetchone()["n"] == 1
-    ), "redelivery must not create a second row"
+    assert pg_conn.execute("SELECT count(*) AS n FROM edits").fetchone()["n"] == 1, (
+        "redelivery must not create a second row"
+    )
+
+    # The pre-check hides the UPSERT's ON CONFLICT DO UPDATE from worker
+    # redelivery, but retrier and sweeper still upsert_edit onto ids that may
+    # already be classified (duplicate envelopes are allowed by design), so
+    # pin it at the SQL boundary: a second write for the same id must re-run
+    # the update -- processed_at advances, no UniqueViolation -- while still
+    # collapsing onto exactly one row.
+    db.upsert_edit(
+        pg_conn,
+        FULL_EDIT,
+        Classification("substantive", 0.9, "refreshed", "test-model"),
+    )
+    row3 = pg_conn.execute(
+        "SELECT * FROM edits WHERE id = %s", (FULL_EDIT["id"],)
+    ).fetchone()
+    assert row3["processed_at"] > first_processed_at, (
+        "ON CONFLICT DO UPDATE must re-run for an existing id, not raise"
+    )
+    assert pg_conn.execute("SELECT count(*) AS n FROM edits").fetchone()["n"] == 1
 
 
 def test_schema_mismatch_parks_to_dlq_with_real_psycopg_error(pg_conn):
@@ -105,9 +125,7 @@ def test_schema_mismatch_parks_to_dlq_with_real_psycopg_error(pg_conn):
     assert "invalid input syntax" in envelope["error"]
     assert json.loads(base64.b64decode(envelope["raw"])) == poison
     assert (
-        pg_conn.execute(
-            "SELECT * FROM edits WHERE id = %s", (poison["id"],)
-        ).fetchone()
+        pg_conn.execute("SELECT * FROM edits WHERE id = %s", (poison["id"],)).fetchone()
         is None
     )
 

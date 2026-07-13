@@ -4,11 +4,11 @@ import psycopg
 from fastapi import FastAPI, HTTPException, Query
 from psycopg.rows import dict_row
 
+from app.classifier import VALID_LABELS
 from app.config import settings
 
 app = FastAPI(title="wiki-edits")
 
-VALID_LABELS = {"vandalism", "substantive", "trivia", "unclear"}
 VALID_STATUSES = {"classified", "failed"}
 
 

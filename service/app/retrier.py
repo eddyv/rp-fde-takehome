@@ -108,6 +108,9 @@ def handle_envelope(client, conn, consumer, producer, breaker, message):
         edit = envelope["edit"]
         if not isinstance(edit, dict) or edit.get("id") is None:
             raise TypeError(f"not an edit object: {type(edit).__name__}")
+        schema = envelope.get("schema")
+        if schema != failures.ENVELOPE_SCHEMA:
+            raise ValueError(f"unsupported envelope schema: {schema!r}")
         attempts = int(envelope.get("attempts", 1))
         _parse_not_before(envelope.get("not_before"))  # validate before use
     except (

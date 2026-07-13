@@ -27,6 +27,9 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Stamped into every envelope; the retrier and sweeper route any other
+# version to their malformed/skip paths, so a future producer-side bump
+# cannot be silently misread by an older consumer.
 ENVELOPE_SCHEMA = 1
 
 REASON_TRANSIENT_EXHAUSTED = "transient_exhausted"

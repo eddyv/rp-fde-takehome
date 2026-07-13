@@ -231,6 +231,17 @@ def test_undecodable_dlq_record_is_skipped_and_committed(monkeypatch):
     assert consumer.committed[TP].offset == 6
 
 
+def test_unexpected_envelope_schema_version_is_skipped_and_committed(monkeypatch):
+    consumer = FakeSweeperConsumer([dlq_message(schema=2)])
+    client = FakeClient([])  # any classify call would blow up the fake
+
+    producer = run_sweeper(monkeypatch, consumer, client)
+
+    assert client.calls == [], "unknown versions must be skipped before classify"
+    assert producer.sent == []
+    assert consumer.committed[TP].offset == 1, "skipped like an undecodable record"
+
+
 def test_envelope_without_usable_edit_is_skipped(monkeypatch):
     consumer = FakeSweeperConsumer([dlq_message(edit={"title": "no id"})])
     client = FakeClient([])
