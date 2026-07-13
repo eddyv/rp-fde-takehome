@@ -21,6 +21,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 
 from kafka import KafkaProducer
+from kafka.serializer import Serializer
 
 from app.config import settings
 
@@ -91,12 +92,17 @@ def next_not_before(attempts: int) -> str:
     return (utcnow() + timedelta(seconds=retry_delay_seconds(attempts))).isoformat()
 
 
+class JsonSerializer(Serializer):
+    def serialize(self, topic, headers, data):
+        return json.dumps(data).encode("utf-8")
+
+
 def make_producer() -> KafkaProducer:
     return KafkaProducer(
         bootstrap_servers=settings.kafka_brokers.split(","),
         acks="all",
         retries=5,
-        value_serializer=lambda value: json.dumps(value).encode("utf-8"),
+        value_serializer=JsonSerializer(),
     )
 
 
