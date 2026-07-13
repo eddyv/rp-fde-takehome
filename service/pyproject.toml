@@ -21,6 +21,11 @@ markers = [
     "integration: needs Docker (testcontainers); run with: uv run pytest -m integration",
     "llm: also needs the Ollama model pulled; slow",
 ]
+# Third-party deprecation noise only; warnings raised from our own code still show.
+filterwarnings = [
+    "ignore::starlette.exceptions.StarletteDeprecationWarning",
+    "ignore:The wait_for_logs function.*:DeprecationWarning:testcontainers",
+]
 
 # Mutation testing. Run from this directory (service/): `uv run mutmut run`.
 # mutmut matches mutants to tests by module name, so source_paths must be the
