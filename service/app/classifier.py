@@ -129,6 +129,12 @@ def call_model(client: anthropic.Anthropic, prompt: str, model: str):
                 last_error = error
             else:
                 raise ModelConfigError(str(error)) from error
+        except anthropic.APIError as error:
+            # Non-status API errors (e.g. APIResponseValidationError, which
+            # subclasses APIError directly) carry no status code to triage on;
+            # treat them as transient so exhaustion lands in
+            # ModelUnavailableError instead of crash-looping the worker.
+            last_error = error
         if attempt < MAX_CALL_ATTEMPTS - 1:
             time.sleep(BACKOFF_SECONDS[attempt])
     raise ModelUnavailableError(str(last_error)) from last_error
@@ -150,9 +156,18 @@ def normalize(parsed: dict, model: str) -> Classification | None:
     # and this also guards non-conforming fakes.
     if label not in VALID_LABELS:
         return None
+    # The schema types confidence as number, but Anthropic-compat endpoints
+    # can drop the schema entirely (see tests/integration/test_pipeline_e2e.py),
+    # so any JSON type is reachable here. bool subclasses int — reject it too
+    # rather than silently reading true as 1.0.
+    confidence = parsed.get("confidence", 0.0)
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+        return None
     # Numeric range constraints are not schema-enforceable, so clamping stays
     # load-bearing; float() covers JSON integers.
-    confidence = min(max(float(parsed.get("confidence", 0.0)), 0.0), 1.0)
+    if not 0.0 <= confidence <= 1.0:
+        logger.warning("clamping out-of-range confidence %r into [0, 1]", confidence)
+    confidence = min(max(float(confidence), 0.0), 1.0)
     reasoning = str(parsed.get("reasoning", ""))
     return Classification(label, confidence, reasoning, model)
 

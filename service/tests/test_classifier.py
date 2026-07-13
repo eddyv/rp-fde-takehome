@@ -1,6 +1,10 @@
 """Classifier taxonomy and parse-path tests; no network (see tests.fakes)."""
 
+import logging
+
+import anthropic
 import app.classifier
+import httpx
 import pytest
 from app.classifier import (
     OUTPUT_SCHEMA,
@@ -198,6 +202,30 @@ def test_second_pass_unusable_output_keeps_first_result():
     assert len(client.calls) == 2, "second pass is single-shot, never retried"
 
 
+def make_validation_error() -> anthropic.APIResponseValidationError:
+    """Build a real SDK validation error; it subclasses APIError directly
+    (not APIStatusError), so make_status_error() cannot produce it."""
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    response = httpx.Response(200, request=request, json={"unexpected": "shape"})
+    return anthropic.APIResponseValidationError(
+        response=response, body=None, message="response validation failed"
+    )
+
+
+def test_response_validation_error_exhausts_to_unavailable(monkeypatch):
+    sleeps: list = []
+    monkeypatch.setattr(app.classifier.time, "sleep", lambda s: sleeps.append(s))
+    client = FakeClient([make_validation_error() for _ in range(3)])
+
+    # No status code to triage on, so it must ride the transient path and
+    # end in the taxonomy — never escape as a raw SDK exception.
+    with pytest.raises(ModelUnavailableError, match="response validation failed"):
+        classify(client, EDIT)
+
+    assert len(client.calls) == 3
+    assert sleeps == [1, 2]
+
+
 @pytest.mark.parametrize("status", [500, 502, 503])
 def test_5xx_exhaustion_raises_unavailable_after_three_calls(status):
     client = FakeClient([make_status_error(status)] * 3)
@@ -275,6 +303,34 @@ def test_normalize_rejects_labels_outside_the_enum():
 
 
 @pytest.mark.parametrize(
+    "raw_confidence",
+    ["high", None, True, False, [0.9], {"value": 0.9}],
+)
+def test_normalize_rejects_non_numeric_confidence(raw_confidence):
+    # bool included: it subclasses int, so a plain isinstance check would
+    # silently read true as 1.0.
+    parsed = {"label": "vandalism", "confidence": raw_confidence, "reasoning": "x"}
+    assert normalize(parsed, "m") is None
+
+
+@pytest.mark.parametrize("raw_confidence", ['"high"', "null", "true", "[0.9]"])
+def test_non_numeric_confidence_raises_parse_error_end_to_end(raw_confidence):
+    # Reachable in production: Ollama's Anthropic-compat endpoint silently
+    # drops output_config's json_schema (see tests/integration/
+    # test_pipeline_e2e.py), so valid JSON with a non-numeric confidence must
+    # surface as the taxonomy's parse error — a ValueError/TypeError here
+    # crash-looped the worker with the offset uncommitted.
+    client = FakeClient(
+        [f'{{"label": "vandalism", "confidence": {raw_confidence}, "reasoning": "x"}}']
+    )
+
+    with pytest.raises(ClassificationParseError, match="edit 1"):
+        classify(client, EDIT)
+
+    assert len(client.calls) == 1, "unusable output must not be retried"
+
+
+@pytest.mark.parametrize(
     ("raw_confidence", "expected"),
     [
         (1.5, 1.0),  # clamped down
@@ -292,17 +348,20 @@ def test_normalize_clamps_and_floors_confidence(raw_confidence, expected):
     assert isinstance(confidence, float)
 
 
-def test_out_of_range_confidence_is_clamped_end_to_end():
+def test_out_of_range_confidence_is_clamped_end_to_end(caplog):
     # 1.5 deliberately: above the threshold so no second pass fires, and out
     # of range so the clamp (not the schema) must bound it.
     client = FakeClient(
         ['{"label": "trivia", "confidence": 1.5, "reasoning": "typo fix"}']
     )
 
-    result = classify(client, EDIT)
+    with caplog.at_level(logging.WARNING, logger="app.classifier"):
+        result = classify(client, EDIT)
 
     assert result.confidence == 1.0
     assert len(client.calls) == 1, "clamped confidence must not trigger a second pass"
+    [record] = [r for r in caplog.records if "clamping" in r.message]
+    assert "1.5" in record.getMessage(), "the warning must carry the raw value"
 
 
 def test_normalize_defaults_missing_reasoning_to_empty_string():
