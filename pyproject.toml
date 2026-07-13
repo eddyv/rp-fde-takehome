@@ -20,6 +20,7 @@ dev = [
     "mutmut>=3.6.0",
     "pytest>=9.0.3",
     "ruff>=0.15.14",
+    "testcontainers[ollama,postgres]>=4.14",
     "ty>=0.0.40",
 ]
 
@@ -28,3 +29,8 @@ select = ["I", "F", "E"]
 
 [tool.pytest.ini_options]
 testpaths = ["service/tests"]
+addopts = "-m 'not integration'"
+markers = [
+    "integration: needs Docker (testcontainers); run with: uv run pytest -m integration",
+    "llm: also needs the Ollama model pulled; slow",
+]

@@ -68,6 +68,7 @@ def main() -> None:
     # timeout keeps a hung call from stalling the drain for 10 minutes.
     client = anthropic.Anthropic(
         api_key=settings.anthropic_api_key.get_secret_value(),
+        base_url=settings.anthropic_base_url,
         max_retries=0,
         timeout=60.0,
     )

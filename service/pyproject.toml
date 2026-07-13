@@ -16,6 +16,11 @@ dependencies = [
 # collects mutmut's mutants/tests copy and dies on an import mismatch.
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-m 'not integration'"
+markers = [
+    "integration: needs Docker (testcontainers); run with: uv run pytest -m integration",
+    "llm: also needs the Ollama model pulled; slow",
+]
 
 # Mutation testing. Run from this directory (service/): `uv run mutmut run`.
 # mutmut matches mutants to tests by module name, so source_paths must be the

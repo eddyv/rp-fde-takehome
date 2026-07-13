@@ -6,6 +6,9 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env")
 
     anthropic_api_key: SecretStr = SecretStr("")
+    # None means "let the SDK decide" (env ANTHROPIC_BASE_URL or its default);
+    # set to point the client at an Anthropic-compat endpoint (e.g. Ollama).
+    anthropic_base_url: str | None = None
     kafka_brokers: str = "localhost:19092"
     kafka_topic: str = "wiki.edits.raw"
     kafka_retry_topic: str = "wiki.edits.retry"
