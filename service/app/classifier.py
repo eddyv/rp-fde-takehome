@@ -1,14 +1,18 @@
 """The LLM loop, as distinct named stages:
 
-build prompt -> call model -> parse -> normalize -> (retry once on parse
-failure) -> (second pass if confidence is low).
+build prompt -> call model -> parse -> normalize -> (second pass if
+confidence is low).
+
+The model call uses Anthropic structured outputs (output_config.format with a
+JSON schema), which guarantees the response text is valid JSON matching
+OUTPUT_SCHEMA — except when stop_reason is "refusal" or "max_tokens".
 
 Failures surface as a typed taxonomy instead of a fallback row, so callers
 can route each class differently (crash / retry topic / DLQ — see worker.py):
 
 - ModelConfigError: deterministic (no key, 4xx) — retrying cannot help.
 - ModelUnavailableError: transient errors exhausted the in-process budget.
-- ClassificationParseError: output stayed unusable after the format retry.
+- ClassificationParseError: refusal, truncation, or non-conforming output.
 
 The Anthropic client is passed in so tests can substitute a fake.
 """
@@ -25,6 +29,20 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 VALID_LABELS = {"vandalism", "substantive", "trivia", "unclear"}
+
+# sorted() for deterministic serialization — helps prompt caching and
+# reproducibility. Numeric range constraints are not supported by structured
+# outputs, so confidence bounds are enforced in normalize().
+OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "label": {"type": "string", "enum": sorted(VALID_LABELS)},
+        "confidence": {"type": "number"},
+        "reasoning": {"type": "string"},
+    },
+    "required": ["label", "confidence", "reasoning"],
+    "additionalProperties": False,
+}
 
 MAX_CALL_ATTEMPTS = 3
 BACKOFF_SECONDS = [1, 2, 4]
@@ -51,7 +69,7 @@ class ModelUnavailableError(ClassifierError):
 
 
 class ClassificationParseError(ClassifierError):
-    """Model output was unusable even after the format-reminder retry."""
+    """Model output was unusable: refusal, truncation, or non-conforming."""
 
 
 def build_prompt(edit: dict) -> str:
@@ -64,8 +82,7 @@ def build_prompt(edit: dict) -> str:
         f"Article title: {edit.get('title')}\n"
         f"Edit comment: {edit.get('comment') or '(none)'}\n"
         f"Byte delta: {edit.get('byte_delta')}\n\n"
-        'Respond with only a JSON object: {"label": "...", "confidence": 0.0-1.0, '
-        '"reasoning": "one sentence"}'
+        "Confidence is 0.0-1.0; reasoning should be one sentence."
     )
 
 
@@ -82,22 +99,23 @@ def build_second_pass_prompt(edit: dict) -> str:
     )
 
 
-def call_model(client: anthropic.Anthropic, prompt: str, model: str) -> str:
+def call_model(client: anthropic.Anthropic, prompt: str, model: str):
     """One logical call with bounded retry + backoff on transient errors.
 
+    Returns the full response object so the caller can inspect stop_reason.
     Raises ModelConfigError immediately on deterministic failures, and
     ModelUnavailableError once the transient retry budget is exhausted.
     """
     last_error = None
     for attempt in range(MAX_CALL_ATTEMPTS):
         try:
-            response = client.messages.create(
+            return client.messages.create(
                 model=model,
                 max_tokens=256,
                 messages=[{"role": "user", "content": prompt}],
-            )
-            return "".join(
-                block.text for block in response.content if block.type == "text"
+                output_config={
+                    "format": {"type": "json_schema", "schema": OUTPUT_SCHEMA}
+                },
             )
         except (anthropic.RateLimitError, anthropic.APIConnectionError) as error:
             last_error = error
@@ -117,39 +135,25 @@ def call_model(client: anthropic.Anthropic, prompt: str, model: str) -> str:
 
 
 def parse_response(text: str) -> dict | None:
-    """Extract the first {...} block from possibly dirty model output.
-
-    Brace-counting handles nested objects; returns None if nothing parses.
-    """
-    start = text.find("{")
-    if start == -1:
+    """Parse model output as JSON; returns None unless it is an object."""
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
         return None
-    depth = 0
-    for index in range(start, len(text)):
-        if text[index] == "{":
-            depth += 1
-        elif text[index] == "}":
-            depth -= 1
-            if depth == 0:
-                try:
-                    parsed = json.loads(text[start : index + 1])
-                except json.JSONDecodeError:
-                    return None
-                return parsed if isinstance(parsed, dict) else None
-    return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def normalize(parsed: dict, model: str) -> Classification | None:
-    """Validate the parsed object; models drift outside the enum."""
-    label = str(parsed.get("label", "")).strip().lower()
+    """Validate the parsed object; enforce the bounds the schema cannot."""
+    label = parsed.get("label")
+    # Last-line defense: the schema does not apply on refusal-shaped output,
+    # and this also guards non-conforming fakes.
     if label not in VALID_LABELS:
         return None
-    try:
-        confidence = float(parsed.get("confidence", 0.0))
-    except (TypeError, ValueError):
-        confidence = 0.0
-    confidence = min(max(confidence, 0.0), 1.0)
-    reasoning = str(parsed.get("reasoning", "")).strip()
+    # Numeric range constraints are not schema-enforceable, so clamping stays
+    # load-bearing; float() covers JSON integers.
+    confidence = min(max(float(parsed.get("confidence", 0.0)), 0.0), 1.0)
+    reasoning = str(parsed.get("reasoning", ""))
     return Classification(label, confidence, reasoning, model)
 
 
@@ -157,7 +161,12 @@ def _attempt(
     client: anthropic.Anthropic, prompt: str, model: str
 ) -> Classification | None:
     """call -> parse -> normalize; None means the output was unusable."""
-    text = call_model(client, prompt, model)
+    response = call_model(client, prompt, model)
+    if response.stop_reason in ("refusal", "max_tokens"):
+        # The schema guarantee does not apply in these two cases.
+        return None
+    # thinking/other blocks may still precede the text block.
+    text = "".join(block.text for block in response.content if block.type == "text")
     parsed = parse_response(text)
     if parsed is None:
         return None
@@ -176,13 +185,8 @@ def classify(
 
     result = _attempt(client, prompt, model)
     if result is None:
-        # Retry once on parse failure with an explicit format reminder.
-        result = _attempt(
-            client, prompt + "\n\nReturn ONLY the JSON object, nothing else.", model
-        )
-    if result is None:
         raise ClassificationParseError(
-            f"model output unusable after format retry for edit {edit.get('id')}"
+            f"model output unusable for edit {edit.get('id')}"
         )
 
     if result.confidence < settings.confidence_threshold:

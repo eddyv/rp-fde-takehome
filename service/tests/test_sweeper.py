@@ -178,7 +178,7 @@ def test_still_transient_requeues_to_dlq_tail_with_attempts_bumped(monkeypatch):
 
 def test_still_unparseable_requeues_as_parse_failed(monkeypatch):
     consumer = FakeSweeperConsumer([dlq_message()])
-    client = FakeClient(["no json", "still no json"])
+    client = FakeClient(["no json"])
 
     producer = run_sweeper(monkeypatch, consumer, client)
 

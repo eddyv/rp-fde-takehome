@@ -1,8 +1,9 @@
 """Shared test doubles: no network, no broker, no Postgres.
 
 FakeClient replays scripted model outputs; items may be strings (returned as
-a text block) or Exception instances (raised from create()), so tests can
-script real SDK errors built by make_status_error().
+a text block), Exception instances (raised from create()), block lists, or a
+SimpleNamespace built with make_response() to script a custom stop_reason.
+Real SDK errors are built by make_status_error().
 """
 
 from types import SimpleNamespace
@@ -29,12 +30,18 @@ def make_block(block_type: str, text: str) -> SimpleNamespace:
     return SimpleNamespace(type=block_type, text=text)
 
 
+def make_response(blocks: list, stop_reason: str = "end_turn") -> SimpleNamespace:
+    """A full response, for scripting a custom stop_reason (e.g. refusal)."""
+    return SimpleNamespace(content=blocks, stop_reason=stop_reason)
+
+
 class FakeClient:
     """Stands in for anthropic.Anthropic; replays scripted outputs.
 
     Each output may be a string (one text block), an Exception (raised from
-    create()), or a list of blocks built with make_block() for responses
-    that mix text and non-text content.
+    create()), a list of blocks built with make_block() for responses that
+    mix text and non-text content, or a make_response() SimpleNamespace
+    passed through verbatim.
     """
 
     def __init__(self, outputs: list):
@@ -49,9 +56,13 @@ class FakeClient:
         item = self._outputs.pop(0)
         if isinstance(item, Exception):
             raise item
+        if isinstance(item, SimpleNamespace):
+            return item
         if isinstance(item, list):
-            return SimpleNamespace(content=item)
-        return SimpleNamespace(content=[SimpleNamespace(type="text", text=item)])
+            return SimpleNamespace(content=item, stop_reason="end_turn")
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text=item)], stop_reason="end_turn"
+        )
 
 
 class FakeFuture:

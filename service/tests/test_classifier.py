@@ -3,6 +3,7 @@
 import app.classifier
 import pytest
 from app.classifier import (
+    OUTPUT_SCHEMA,
     VALID_LABELS,
     ClassificationParseError,
     ModelConfigError,
@@ -15,48 +16,35 @@ from app.classifier import (
 )
 from app.config import settings
 
-from tests.fakes import FakeClient, make_block, make_status_error
+from tests.fakes import FakeClient, make_block, make_response, make_status_error
 
 EDIT = {"id": "1", "title": "X", "comment": "", "byte_delta": 5}
 GOOD_JSON = '{"label": "trivia", "confidence": 0.9, "reasoning": "typo fix"}'
 
 
-def test_malformed_output_retries_once_then_raises_parse_error():
-    client = FakeClient(
-        [
-            "Sure! The label is probably vandalism but here is no JSON.",
-            "still {not valid json",
-        ]
-    )
+def test_unusable_output_raises_parse_error_after_exactly_one_call():
+    client = FakeClient(["still {not valid json"])
 
     # The error must name the edit so DLQ provenance stays useful.
     with pytest.raises(ClassificationParseError, match="edit 1"):
         classify(client, EDIT)
 
-    assert len(client.calls) == 2, "expected exactly one retry after parse failure"
+    assert len(client.calls) == 1, "structured outputs removed the format retry"
     assert client.calls[0] == build_prompt(EDIT)
-    assert client.calls[1] == (
-        build_prompt(EDIT) + "\n\nReturn ONLY the JSON object, nothing else."
-    ), "retry must be the same prompt with only the format reminder appended"
 
 
-def test_retry_recovers_when_second_output_is_dirty_but_parseable():
+@pytest.mark.parametrize("stop_reason", ["refusal", "max_tokens"])
+def test_refusal_and_truncation_raise_parse_error_after_one_call(stop_reason):
+    # The schema guarantee does not apply on these stop reasons, so the text
+    # must never be trusted — even if it happens to look like valid JSON.
     client = FakeClient(
-        [
-            "no json here at all",
-            'Here you go: {"label": " Vandalism ", "confidence": 0.9, '
-            '"reasoning": "page blanked"} hope that helps!',
-        ]
+        [make_response([make_block("text", GOOD_JSON)], stop_reason=stop_reason)]
     )
 
-    result = classify(
-        client, {"id": "2", "title": "Y", "comment": "", "byte_delta": -4000}
-    )
+    with pytest.raises(ClassificationParseError, match="edit 1"):
+        classify(client, EDIT)
 
-    assert result.label == "vandalism"  # extracted from prose, trimmed, lowercased
-    assert result.confidence == 0.9
-    assert result.model == settings.anthropic_model, "retry keeps the same model"
-    assert len(client.calls) == 2
+    assert len(client.calls) == 1, "refusal/truncation must not be retried"
 
 
 def test_missing_api_key_typeerror_is_config_error():
@@ -99,15 +87,30 @@ def test_request_shape_is_single_user_message_with_bounded_tokens():
     assert kwargs["model"] == settings.anthropic_model
     assert kwargs["max_tokens"] == 256
     assert kwargs["messages"] == [{"role": "user", "content": build_prompt(EDIT)}]
+    assert kwargs["output_config"] == {
+        "format": {"type": "json_schema", "schema": OUTPUT_SCHEMA}
+    }
 
 
-def test_non_text_blocks_are_ignored_and_text_blocks_concatenated():
+def test_output_schema_pins_the_enum_to_the_validation_set():
+    assert OUTPUT_SCHEMA["properties"]["label"]["enum"] == sorted(VALID_LABELS), (
+        "the schema enum must be exactly the labels normalize() accepts, "
+        "or the model is offered answers the validator rejects (and vice versa)"
+    )
+    assert set(OUTPUT_SCHEMA["required"]) == {"label", "confidence", "reasoning"}, (
+        "all three keys must be schema-required so parsed output always has them"
+    )
+    assert OUTPUT_SCHEMA["additionalProperties"] is False, (
+        "structured outputs requires additionalProperties: false"
+    )
+
+
+def test_non_text_blocks_are_filtered_out():
     client = FakeClient(
         [
             [
                 make_block("thinking", "NOT JSON {{{"),
-                make_block("text", '{"label": "trivia", "confidence'),
-                make_block("text", '": 0.9, "reasoning": "typo fix"}'),
+                make_block("text", GOOD_JSON),
             ]
         ]
     )
@@ -116,7 +119,7 @@ def test_non_text_blocks_are_ignored_and_text_blocks_concatenated():
 
     assert result.label == "trivia"
     assert result.confidence == 0.9
-    assert len(client.calls) == 1, "the joined text blocks must parse first try"
+    assert len(client.calls) == 1, "the text block must parse first try"
 
 
 @pytest.mark.parametrize("status", [500, 408, 409])
@@ -192,7 +195,7 @@ def test_second_pass_unusable_output_keeps_first_result():
 
     assert result.label == "unclear"
     assert result.confidence == 0.3
-    assert len(client.calls) == 2, "second pass is single-shot, no format retry"
+    assert len(client.calls) == 2, "second pass is single-shot, never retried"
 
 
 @pytest.mark.parametrize("status", [500, 502, 503])
@@ -213,14 +216,6 @@ def test_prompt_label_menu_matches_the_validation_enum():
             "every label normalize() accepts must be offered to the model, "
             "or valid answers get rejected as enum drift"
         )
-
-
-def test_prompt_demands_json_with_the_keys_parse_and_normalize_expect():
-    prompt = build_prompt(EDIT)
-
-    assert "JSON object" in prompt, "parse_response only extracts {...} objects"
-    for key in ("label", "confidence", "reasoning"):
-        assert f'"{key}"' in prompt, "normalize() reads exactly these keys"
 
 
 def test_prompt_includes_the_edit_fields_the_model_judges():
@@ -260,42 +255,18 @@ def test_second_pass_prompt_extends_first_pass_with_editor_context():
     assert "en.wikipedia.org" in extra
 
 
-def test_parse_response_takes_first_object_and_handles_nesting():
-    assert parse_response('pre {"a": {"b": 1}} post {"c": 2}') == {"a": {"b": 1}}
-
-
-def test_parse_response_handles_braces_at_any_position():
-    assert parse_response('{"a": 1}') == {"a": 1}
-    assert parse_response('x{"a": 1}') == {"a": 1}, "object starting at index 1"
-    assert parse_response('{"a": 1}x tail') == {"a": 1}, "text right after the brace"
-    assert parse_response('} {"a": 1}') == {"a": 1}, "stray brace before the object"
-
-
 @pytest.mark.parametrize(
     "text",
     [
         "",  # empty model output
-        "no braces at all",
-        "{never closes",
-        '{"bad": json,}',
-        "[1, 2, 3]",  # JSON but not an object
-        'the answer is ["x"] ok',
+        "not json",
+        '{"truncated": ',
+        "[1, 2, 3]",  # valid JSON, not a dict
+        '"just a string"',
     ],
 )
 def test_parse_response_rejects_unusable_output(text):
     assert parse_response(text) is None
-
-
-def test_normalize_trims_and_lowercases_label_and_reasoning():
-    result = normalize(
-        {"label": " Vandalism ", "confidence": 0.7, "reasoning": "  blanked  "},
-        "m",
-    )
-
-    assert result.label == "vandalism"
-    assert result.confidence == 0.7
-    assert result.reasoning == "blanked"
-    assert result.model == "m"
 
 
 def test_normalize_rejects_labels_outside_the_enum():
@@ -308,18 +279,30 @@ def test_normalize_rejects_labels_outside_the_enum():
     [
         (1.5, 1.0),  # clamped down
         (-0.5, 0.0),  # clamped up
-        ("0.4", 0.4),  # numeric string coerced
-        ("high", 0.0),  # junk floors, never inflates
-        (None, 0.0),
-        ("__missing__", 0.0),  # absent key floors too
+        (1, 1.0),  # JSON integer coerced to float
     ],
 )
 def test_normalize_clamps_and_floors_confidence(raw_confidence, expected):
-    parsed = {"label": "trivia", "reasoning": "r"}
-    if raw_confidence != "__missing__":
-        parsed["confidence"] = raw_confidence
+    parsed = {"label": "trivia", "confidence": raw_confidence, "reasoning": "r"}
 
-    assert normalize(parsed, "m").confidence == expected
+    confidence = normalize(parsed, "m").confidence
+    assert confidence == expected
+    # Pin the float() coercion: 1 == 1.0 is True in Python, so the value
+    # assertion alone cannot catch a dropped int-to-float conversion.
+    assert isinstance(confidence, float)
+
+
+def test_out_of_range_confidence_is_clamped_end_to_end():
+    # 1.5 deliberately: above the threshold so no second pass fires, and out
+    # of range so the clamp (not the schema) must bound it.
+    client = FakeClient(
+        ['{"label": "trivia", "confidence": 1.5, "reasoning": "typo fix"}']
+    )
+
+    result = classify(client, EDIT)
+
+    assert result.confidence == 1.0
+    assert len(client.calls) == 1, "clamped confidence must not trigger a second pass"
 
 
 def test_normalize_defaults_missing_reasoning_to_empty_string():

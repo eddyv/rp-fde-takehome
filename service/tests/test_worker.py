@@ -169,7 +169,7 @@ def test_config_error_crashes_without_commit_or_publish():
 def test_parse_failure_failed_row_then_dlq_and_breaker_reset():
     conn, consumer, producer, breaker, log = make_fixtures()
     breaker.record_failure()  # pre-existing transient streak
-    client = FakeClient(["no json", "still no json"])
+    client = FakeClient(["no json"])
     message = make_message(json.dumps(EDIT).encode())
 
     handle_message(client, conn, consumer, producer, breaker, message)

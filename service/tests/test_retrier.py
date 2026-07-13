@@ -120,7 +120,7 @@ def test_success_flips_row_to_classified_and_resets_breaker():
 def test_parse_failure_goes_to_dlq_and_resets_breaker():
     conn, consumer, producer, breaker, log = make_fixtures()
     breaker.record_failure()
-    client = FakeClient(["no json", "still nothing"])
+    client = FakeClient(["no json"])
     message = make_envelope_message(attempts=2)
 
     handle_envelope(client, conn, consumer, producer, breaker, message)
