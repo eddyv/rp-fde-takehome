@@ -11,6 +11,7 @@ dependencies = [
     "uvicorn==0.51.0",
     "pydantic-settings==2.14.2",
     "sqlalchemy==2.0.51",
+    "fastapi-pagination[sqlalchemy]==0.15.15",
 ]
 
 # Without an explicit testpaths, a bare `pytest` from this directory also

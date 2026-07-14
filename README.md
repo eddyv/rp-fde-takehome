@@ -50,16 +50,19 @@ Query results:
 
 ```sh
 curl "http://localhost:8000/edits?label=vandalism"
-curl "http://localhost:8000/edits?status=failed&limit=5"
-# responses are cursor-paginated: {"items": [...], "next_cursor": "eyJwIjoi..."}
-# pass next_cursor back as ?cursor= (with the same filters) until it is null
-curl "http://localhost:8000/edits?limit=5&cursor=eyJwIjoi..."
+curl "http://localhost:8000/edits?status=failed&size=5"
+# responses are CursorPage envelopes (fastapi-pagination):
+# {"items": [...], "total": null, "current_page": ..., "current_page_backwards": ...,
+#  "previous_page": ..., "next_page": "eyJwIjoi..."}
+# pass next_page back as ?cursor= (with the same filters) until it is null
+curl "http://localhost:8000/edits?size=5&cursor=eyJwIjoi..."
 ```
 ## Design Notes
-- Pagination is a keyset on the composite `(processed_at, id)`
-(id breaks timestamp ties). A time-ordered UUIDv7 primary key would collapse
-that to a single column, but native `uuidv7()` needs Postgres 18 or an
-extension — we kept Postgres 16 as is for now.
+- Pagination is provided by fastapi-pagination (backed by sqlakeyset) over a
+keyset on the composite `(processed_at, id)` (id breaks timestamp ties). A
+time-ordered UUIDv7 primary key would collapse that to a single column, but
+native `uuidv7()` needs Postgres 18 or an extension — we kept Postgres 16 as
+is for now.
 - Without a valid API key the worker deliberately **crash-loops** (visible in
 `docker compose ps`) instead of draining the topic into fake data: a missing
 or rejected key is a deterministic failure, so offsets stay uncommitted and
@@ -119,8 +122,8 @@ uv run --directory service mutmut results   # list surviving mutants
 - `service/app/retrier.py` — always-on consumer of `wiki.edits.retry`:
   delayed, bounded re-attempts; promotes exhausted messages to the DLQ
 - `service/app/sweeper.py` — manual, on-demand DLQ drain (`--model` override)
-- `service/app/api.py` — `GET /edits?label=&status=&limit=&cursor=`
-  (cursor-paginated)
+- `service/app/api.py` — `GET /edits?label=&status=&size=&cursor=`
+  (fastapi-pagination `CursorPage`)
 - `service/tests/` — classifier taxonomy + parse paths, envelope/breaker
   units, and `handle_message` / `handle_envelope` routing with fakes (no
   network, no broker, no Postgres)
