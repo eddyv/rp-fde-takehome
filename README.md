@@ -108,11 +108,11 @@ uv run --directory service mutmut results   # list surviving mutants
 - `sql/schema.sql` — one `edits` table, `id TEXT` primary key, label +
   `status` (`classified` | `failed`) columns
 - `service/app/classifier.py` — the LLM loop as named stages: prompt build →
-  API call (bounded retry + backoff) → parse first `{...}` block → normalize
-  label to the enum → retry once on parse failure → second-pass prompt when
-  confidence is below threshold. Failures raise a typed taxonomy
-  (`ModelConfigError` / `ModelUnavailableError` / `ClassificationParseError`)
-  instead of fabricating an `unclear` row.
+  API call (bounded retry + backoff, structured outputs pin the JSON schema
+  and label enum) → parse + normalize (confidence clamped; refusal/truncation
+  rejected) → second-pass prompt when confidence is below threshold. Failures
+  raise a typed taxonomy (`ModelConfigError` / `ModelUnavailableError` /
+  `ClassificationParseError`) instead of fabricating an `unclear` row.
 - `service/app/failures.py` — shared failure plumbing: retry/DLQ envelopes,
   backoff schedule, broker-acked publish, circuit breaker
 - `service/app/worker.py` — single Kafka consumer; routes each failure class
@@ -136,7 +136,7 @@ converted into data:
 |---|---|---|---|
 | Config/deterministic | missing key (SDK `TypeError`); 4xx except 408/409 | log CRITICAL, exit(1), **no commit** | crash loop; redelivered after the fix |
 | Transient exhausted | 429 / 5xx / 408 / 409 / network, after 3 in-process attempts (1s/2s/4s) | `status='failed'` row + envelope, commit, breaker++ | `wiki.edits.retry` |
-| Parse failure | unusable output after the format-reminder retry | `status='failed'` row + envelope, commit, breaker reset | `wiki.edits.dlq` |
+| Parse failure | refusal, truncation, or non-conforming output (single call; structured outputs, no format retry) | `status='failed'` row + envelope, commit, breaker reset | `wiki.edits.dlq` |
 | Malformed message | Kafka value isn't JSON | envelope with base64 raw, commit | `wiki.edits.dlq` |
 | Success | — | `status='classified'` row, commit, breaker reset | Postgres |
 

@@ -8,8 +8,7 @@ width = 5 # good
 
 ## Testing
 
-This project is configured with pytest, mutmut, coverage. All changes you make should have a related test for it.
-For evaluations, use deepeval.
+This project is configured with pytest and mutmut. All changes you make should have a related test for it.
 For mutation testing, use mutmut.
 
 ### Mutation testing (mutmut)
@@ -41,8 +40,8 @@ Expectations when you add or change code in `service/app/`:
   equivalent mutants (e.g. `decode("ascii")` -> `decode("ASCII")`, or removing
   a kwarg that restates its default). Everything else needs a test.
 - Prompt text in `classifier.py` is product behavior, not a log message — the
-  golden tests in `test_classifier.py` must be updated deliberately when
-  prompts change.
+  prompt invariant tests in `test_classifier.py` must be updated deliberately
+  when prompts change.
 
 ## Documentation
 
