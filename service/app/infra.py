@@ -1,6 +1,7 @@
 """Shared process-startup factories for worker, retrier, and sweeper."""
 
 import logging
+import signal
 import time
 
 from anthropic import Anthropic  # module-local name: tests patch infra.Anthropic
@@ -14,6 +15,27 @@ logger = logging.getLogger(__name__)
 # One definition (was duplicated in worker.py/retrier.py); config.py's
 # retry_backoff_max_seconds documents an invariant against this value.
 MAX_POLL_INTERVAL_MS = 600_000
+
+
+class ShutdownRequested(Exception):
+    """Raised by install_shutdown_handler's handler to unwind a consumer
+    loop cleanly instead of letting SIGTERM kill the process outright
+    (SIGTERM has no default Python handler, so nothing else would run a
+    try/finally). See KafkaConsumer.close(): it's what actually sends the
+    broker a LeaveGroupRequest instead of waiting out session_timeout_ms.
+    """
+
+
+def install_shutdown_handler() -> None:
+    """Route SIGTERM and SIGINT through one exception so callers can close
+    the consumer/producer/connection in a single try/finally, regardless of
+    which signal arrived."""
+
+    def _raise_shutdown(signum, frame):
+        raise ShutdownRequested()
+
+    signal.signal(signal.SIGTERM, _raise_shutdown)
+    signal.signal(signal.SIGINT, _raise_shutdown)
 
 
 def make_consumer(

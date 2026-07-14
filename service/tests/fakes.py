@@ -81,6 +81,7 @@ class FakeProducer:
     def __init__(self, log: list | None = None):
         self.sent: list[SimpleNamespace] = []
         self.log = log if log is not None else []
+        self.closed = False
 
     def send(self, topic, value=None, key=None) -> FakeFuture:
         future = FakeFuture()
@@ -90,15 +91,28 @@ class FakeProducer:
         self.log.append(("publish", topic))
         return future
 
+    def close(self, timeout=None) -> None:
+        self.closed = True
+        self.log.append(("producer_close",))
+
 
 class FakeConsumer:
-    def __init__(self, log: list | None = None):
+    def __init__(self, log: list | None = None, messages: list | None = None):
         self.commits = 0
         self.log = log if log is not None else []
+        self.closed = False
+        self._messages = messages if messages is not None else []
 
     def commit(self, offsets=None) -> None:
         self.commits += 1
         self.log.append(("commit",))
+
+    def close(self) -> None:
+        self.closed = True
+        self.log.append(("consumer_close",))
+
+    def __iter__(self):
+        return iter(self._messages)
 
 
 class FakeConn:

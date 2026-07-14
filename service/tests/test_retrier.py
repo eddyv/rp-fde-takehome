@@ -7,9 +7,9 @@ from datetime import UTC, datetime, timedelta
 import app.retrier as retrier
 import pytest
 import sqlalchemy.exc
-from app import failures
+from app import failures, infra
 from app.config import settings
-from app.retrier import handle_envelope, wait_until
+from app.retrier import handle_envelope, run, wait_until
 
 from tests.fakes import (
     FakeClient,
@@ -394,3 +394,51 @@ def test_handle_envelope_waits_for_not_before_then_classifies(monkeypatch):
     assert events == [("sleep", 5), ("sleep", 2), ("classify",)], (
         "the envelope's schedule must be honored before calling the model"
     )
+
+
+def test_run_closes_consumer_producer_and_conn_on_normal_exhaustion():
+    conn, consumer, producer, breaker, log = make_fixtures()
+    # No messages: the for-loop exhausts immediately (StopIteration), which
+    # is the normal "no more input" path, not a shutdown signal.
+    client = FakeClient([])
+
+    run(client, conn, consumer, producer, breaker)
+
+    assert consumer.closed
+    assert producer.closed
+    assert conn.closed
+
+
+def test_run_closes_everything_when_shutdown_requested(monkeypatch):
+    conn, consumer, producer, breaker, log = make_fixtures()
+    consumer._messages = [make_message(b"not json")]  # anything; never reached
+    client = FakeClient([])
+
+    def raise_shutdown(*args, **kwargs):
+        raise infra.ShutdownRequested()
+
+    monkeypatch.setattr(retrier, "handle_envelope", raise_shutdown)
+
+    run(client, conn, consumer, producer, breaker)  # must not raise
+
+    assert consumer.closed
+    assert producer.closed
+    assert conn.closed
+
+
+def test_run_still_closes_everything_then_reraises_other_exceptions(monkeypatch):
+    conn, consumer, producer, breaker, log = make_fixtures()
+    consumer._messages = [make_message(b"not json")]
+    client = FakeClient([])
+
+    def raise_system_exit(*args, **kwargs):
+        raise SystemExit(1)
+
+    monkeypatch.setattr(retrier, "handle_envelope", raise_system_exit)
+
+    with pytest.raises(SystemExit):
+        run(client, conn, consumer, producer, breaker)
+
+    assert consumer.closed
+    assert producer.closed
+    assert conn.closed

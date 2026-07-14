@@ -124,7 +124,31 @@ def _handle_edit(client, conn, consumer, producer, breaker, message, edit):
     return conn
 
 
+def run(client, conn, consumer, producer, breaker) -> None:
+    """Consume until asked to stop, then leave the group cleanly.
+
+    ShutdownRequested (SIGTERM/SIGINT, see infra.install_shutdown_handler)
+    unwinds the loop at whatever message it's on; the finally block runs
+    consumer.close() so the broker gets an explicit LeaveGroup instead of
+    waiting out session_timeout_ms to notice we're gone. Any other
+    exception (e.g. SystemExit from a ModelConfigError) still runs the
+    finally block, then propagates as before.
+    """
+    try:
+        for message in consumer:
+            conn = handle_message(client, conn, consumer, producer, breaker, message)
+    except infra.ShutdownRequested:
+        logger.info(
+            "shutdown requested, leaving consumer group %s", settings.consumer_group
+        )
+    finally:
+        consumer.close()
+        producer.close(timeout=10)
+        conn.close()
+
+
 def main() -> None:
+    infra.install_shutdown_handler()
     # See infra.make_classifier_client for the guardrail rationale.
     client = infra.make_classifier_client()
     conn = db.connect()
@@ -133,8 +157,7 @@ def main() -> None:
     breaker = failures.CircuitBreaker(settings.breaker_threshold)
     logger.info("consuming %s from %s", settings.kafka_topic, settings.kafka_brokers)
 
-    for message in consumer:
-        conn = handle_message(client, conn, consumer, producer, breaker, message)
+    run(client, conn, consumer, producer, breaker)
 
 
 if __name__ == "__main__":

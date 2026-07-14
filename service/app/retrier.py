@@ -167,7 +167,27 @@ def _handle_edit(
     return conn
 
 
+def run(client, conn, consumer, producer, breaker) -> None:
+    """Consume until asked to stop, then leave the group cleanly. See
+    worker.run() for the full rationale (SIGTERM/SIGINT -> ShutdownRequested
+    -> consumer.close() sends LeaveGroup instead of waiting out
+    session_timeout_ms)."""
+    try:
+        for message in consumer:
+            conn = handle_envelope(client, conn, consumer, producer, breaker, message)
+    except infra.ShutdownRequested:
+        logger.info(
+            "shutdown requested, leaving consumer group %s",
+            settings.retrier_consumer_group,
+        )
+    finally:
+        consumer.close()
+        producer.close(timeout=10)
+        conn.close()
+
+
 def main() -> None:
+    infra.install_shutdown_handler()
     # See infra.make_classifier_client for the guardrail rationale.
     client = infra.make_classifier_client()
     conn = db.connect()
@@ -178,8 +198,7 @@ def main() -> None:
         "consuming %s from %s", settings.kafka_retry_topic, settings.kafka_brokers
     )
 
-    for message in consumer:
-        conn = handle_envelope(client, conn, consumer, producer, breaker, message)
+    run(client, conn, consumer, producer, breaker)
 
 
 if __name__ == "__main__":

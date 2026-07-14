@@ -5,6 +5,7 @@ retrier, sweeper's client) that previously duplicated or left them unasserted
 (see test_sweeper.py:118-131 for the pattern this mirrors).
 """
 
+import signal
 from types import SimpleNamespace
 
 import pytest
@@ -118,3 +119,19 @@ def test_make_consumer_raises_after_exhausting_retries(monkeypatch):
         infra.make_consumer("a-topic", "a-group", retries=2, delay=1.0)
 
     assert sleeps == [1.0], "sleep between attempts, none after the last failure"
+
+
+def test_install_shutdown_handler_raises_on_sigterm_and_sigint(monkeypatch):
+    handlers: dict = {}
+    monkeypatch.setattr(
+        infra.signal, "signal", lambda sig, handler: handlers.__setitem__(sig, handler)
+    )
+
+    infra.install_shutdown_handler()
+
+    assert signal.SIGTERM in handlers
+    assert signal.SIGINT in handlers
+    with pytest.raises(infra.ShutdownRequested):
+        handlers[signal.SIGTERM](signal.SIGTERM, None)
+    with pytest.raises(infra.ShutdownRequested):
+        handlers[signal.SIGINT](signal.SIGINT, None)

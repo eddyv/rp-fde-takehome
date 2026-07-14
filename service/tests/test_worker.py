@@ -7,9 +7,9 @@ from datetime import UTC, datetime
 import psycopg
 import pytest
 import sqlalchemy.exc
-from app import db, failures
+from app import db, failures, infra, worker
 from app.config import settings
-from app.worker import handle_message
+from app.worker import handle_message, run
 
 from tests.fakes import (
     FakeClient,
@@ -275,3 +275,51 @@ def test_success_upserts_classified_and_resets_breaker():
     assert producer.sent == []
     assert log == [("db",), ("commit",)]
     assert breaker.consecutive_failures == 0
+
+
+def test_run_closes_consumer_producer_and_conn_on_normal_exhaustion():
+    conn, consumer, producer, breaker, log = make_fixtures()
+    # No messages: the for-loop exhausts immediately (StopIteration), which
+    # is the normal "no more input" path, not a shutdown signal.
+    client = FakeClient([])
+
+    run(client, conn, consumer, producer, breaker)
+
+    assert consumer.closed
+    assert producer.closed
+    assert conn.closed
+
+
+def test_run_closes_everything_when_shutdown_requested(monkeypatch):
+    conn, consumer, producer, breaker, log = make_fixtures()
+    consumer._messages = [make_message(b"not json")]  # anything; never reached
+    client = FakeClient([])
+
+    def raise_shutdown(*args, **kwargs):
+        raise infra.ShutdownRequested()
+
+    monkeypatch.setattr(worker, "handle_message", raise_shutdown)
+
+    run(client, conn, consumer, producer, breaker)  # must not raise
+
+    assert consumer.closed
+    assert producer.closed
+    assert conn.closed
+
+
+def test_run_still_closes_everything_then_reraises_other_exceptions(monkeypatch):
+    conn, consumer, producer, breaker, log = make_fixtures()
+    consumer._messages = [make_message(b"not json")]
+    client = FakeClient([])
+
+    def raise_system_exit(*args, **kwargs):
+        raise SystemExit(1)
+
+    monkeypatch.setattr(worker, "handle_message", raise_system_exit)
+
+    with pytest.raises(SystemExit):
+        run(client, conn, consumer, producer, breaker)
+
+    assert consumer.closed
+    assert producer.closed
+    assert conn.closed
