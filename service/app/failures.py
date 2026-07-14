@@ -102,7 +102,7 @@ class JsonSerializer(Serializer):
 
 def make_producer() -> KafkaProducer:
     return KafkaProducer(
-        bootstrap_servers=settings.kafka_brokers.split(","),
+        bootstrap_servers=settings.kafka_broker_list,
         acks="all",
         retries=5,
         value_serializer=JsonSerializer(),

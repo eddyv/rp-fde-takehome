@@ -60,20 +60,21 @@ def get_session():
         yield session
 
 
+def _validate_choice(value: str | None, valid: set[str], field: str) -> None:
+    if value is not None and value not in valid:
+        raise HTTPException(
+            status_code=400, detail=f"{field} must be one of {sorted(valid)}"
+        )
+
+
 @app.get("/edits")
 def get_edits(
     label: str | None = Query(default=None),
     status: str | None = Query(default=None),
     session: Session = Depends(get_session),
 ) -> EditsPage:
-    if label is not None and label not in VALID_LABELS:
-        raise HTTPException(
-            status_code=400, detail=f"label must be one of {sorted(VALID_LABELS)}"
-        )
-    if status is not None and status not in VALID_STATUSES:
-        raise HTTPException(
-            status_code=400, detail=f"status must be one of {sorted(VALID_STATUSES)}"
-        )
+    _validate_choice(label, VALID_LABELS, "label")
+    _validate_choice(status, VALID_STATUSES, "status")
 
     query = select(Edit).order_by(Edit.processed_at.desc(), Edit.id.desc())
     if label is not None:

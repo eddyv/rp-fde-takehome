@@ -45,18 +45,24 @@ def get_engine() -> Engine:
     return _engines[dsn]
 
 
+# Bound columns shared by both statements below: every edit carries these
+# regardless of whether classification succeeded or failed.
+_COMMON_EDIT_VALUES = {
+    "id": bindparam("id"),
+    "title": bindparam("title"),
+    "editor": bindparam("editor"),
+    "comment": bindparam("comment"),
+    "byte_delta": bindparam("byte_delta"),
+    "reasoning": bindparam("reasoning"),
+    "event_time": bindparam("event_time"),
+}
+
 _upsert = pg_insert(Edit).values(
-    id=bindparam("id"),
-    title=bindparam("title"),
-    editor=bindparam("editor"),
-    comment=bindparam("comment"),
-    byte_delta=bindparam("byte_delta"),
+    **_COMMON_EDIT_VALUES,
     label=bindparam("label"),
     confidence=bindparam("confidence"),
-    reasoning=bindparam("reasoning"),
     model=bindparam("model"),
     status=bindparam("status"),
-    event_time=bindparam("event_time"),
     processed_at=func.now(),
 )
 UPSERT_STMT = _upsert.on_conflict_do_update(
@@ -74,17 +80,11 @@ UPSERT_STMT = _upsert.on_conflict_do_update(
 # A redelivered/stale failure must never downgrade a row a later (or
 # concurrent) success already classified — hence the status guard.
 _failed_upsert = pg_insert(Edit).values(
-    id=bindparam("id"),
-    title=bindparam("title"),
-    editor=bindparam("editor"),
-    comment=bindparam("comment"),
-    byte_delta=bindparam("byte_delta"),
+    **_COMMON_EDIT_VALUES,
     label=null(),
     confidence=null(),
-    reasoning=bindparam("reasoning"),
     model=null(),
     status=literal_column("'failed'"),
-    event_time=bindparam("event_time"),
     processed_at=func.now(),
 )
 FAILED_UPSERT_STMT = _failed_upsert.on_conflict_do_update(
@@ -130,22 +130,28 @@ def connect(retries: int = 30, delay: float = 2.0) -> Connection:
     raise RuntimeError("unreachable")
 
 
+def _common_edit_params(edit: dict) -> dict:
+    return {
+        "id": str(edit["id"]),
+        "title": edit.get("title"),
+        "editor": edit.get("user"),
+        "comment": edit.get("comment"),
+        "byte_delta": edit.get("byte_delta"),
+        "event_time": edit.get("event_time"),  # already ISO from Bloblang
+    }
+
+
 def upsert_edit(conn: Connection, edit: dict, result: Classification) -> None:
     _execute(
         conn,
         UPSERT_STMT,
         {
-            "id": str(edit["id"]),
-            "title": edit.get("title"),
-            "editor": edit.get("user"),
-            "comment": edit.get("comment"),
-            "byte_delta": edit.get("byte_delta"),
+            **_common_edit_params(edit),
             "label": result.label,
             "confidence": result.confidence,
             "reasoning": result.reasoning,
             "model": result.model,
             "status": "classified",
-            "event_time": edit.get("event_time"),  # already ISO from Bloblang
         },
     )
 
@@ -156,15 +162,10 @@ def upsert_failed_edit(conn: Connection, edit: dict, reason: str, error: str) ->
         conn,
         FAILED_UPSERT_STMT,
         {
-            "id": str(edit["id"]),
-            "title": edit.get("title"),
-            "editor": edit.get("user"),
-            "comment": edit.get("comment"),
-            "byte_delta": edit.get("byte_delta"),
+            **_common_edit_params(edit),
             # The column is unbounded TEXT; the cap only bounds the
             # operator-facing provenance an upstream error can dump into it.
             "reasoning": f"failed ({reason}): {error}"[:500],
-            "event_time": edit.get("event_time"),
         },
     )
 
@@ -175,6 +176,13 @@ def fetch_edit_status(conn: Connection, edit: dict) -> str | None:
     return row[0] if row is not None else None
 
 
+def _reconnect(conn: Connection) -> Connection:
+    logger.warning("postgres connection lost, reconnecting")
+    with suppress(Exception):
+        conn.close()
+    return connect()
+
+
 def write_with_reconnect(
     conn: Connection, write: Callable[[Connection], None]
 ) -> Connection:
@@ -182,10 +190,7 @@ def write_with_reconnect(
     try:
         write(conn)
     except sqlalchemy.exc.OperationalError:
-        logger.warning("postgres connection lost, reconnecting")
-        with suppress(Exception):
-            conn.close()
-        conn = connect()
+        conn = _reconnect(conn)
         write(conn)
     return conn
 
@@ -197,8 +202,5 @@ def read_with_reconnect[T](
     try:
         return conn, read(conn)
     except sqlalchemy.exc.OperationalError:
-        logger.warning("postgres connection lost, reconnecting")
-        with suppress(Exception):
-            conn.close()
-        conn = connect()
+        conn = _reconnect(conn)
         return conn, read(conn)

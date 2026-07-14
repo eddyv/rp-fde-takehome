@@ -15,6 +15,8 @@ and guarded failed-row writes), never a lost message.
 
 import logging
 
+import sqlalchemy.exc
+
 from app import db, failures
 from app.classifier import ClassificationParseError, ModelUnavailableError
 from app.config import settings
@@ -125,3 +127,22 @@ def handle_classifier_failure(
         return conn
 
     raise TypeError(f"unhandled classifier failure type: {type(error)!r}")
+
+
+def guard_schema_error(conn, consumer, producer, message, edit, source: str, run):
+    """Run `run()`; a data-shaped SQLAlchemyError parks the message instead of
+    crashing (identical in worker._handle_edit and retrier._handle_edit).
+
+    OperationalError (connection-level) always re-raises so the caller crashes
+    and Kafka redelivers, same as every other write path in this service.
+    """
+    try:
+        return run()
+    except sqlalchemy.exc.OperationalError:
+        raise
+    except sqlalchemy.exc.SQLAlchemyError as error:
+        logger.warning(
+            "edit %s does not fit the schema -> DLQ: %s", edit.get("id"), error
+        )
+        failures.park_malformed(producer, consumer, message, error, source=source)
+        return conn

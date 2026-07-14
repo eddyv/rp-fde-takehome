@@ -23,7 +23,7 @@ def make_consumer(
         try:
             return KafkaConsumer(
                 topic,
-                bootstrap_servers=settings.kafka_brokers.split(","),
+                bootstrap_servers=settings.kafka_broker_list,
                 group_id=group_id,
                 enable_auto_commit=False,
                 auto_offset_reset="earliest",

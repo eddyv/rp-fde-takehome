@@ -43,7 +43,7 @@ CONSUMER_TIMEOUT_MS = 10_000
 def make_consumer() -> KafkaConsumer:
     return KafkaConsumer(
         settings.kafka_dlq_topic,
-        bootstrap_servers=settings.kafka_brokers.split(","),
+        bootstrap_servers=settings.kafka_broker_list,
         group_id=settings.sweeper_consumer_group,
         enable_auto_commit=False,
         auto_offset_reset="earliest",
@@ -54,6 +54,11 @@ def make_consumer() -> KafkaConsumer:
 def _commit(consumer: KafkaConsumer, message) -> None:
     tp = TopicPartition(message.topic, message.partition)
     consumer.commit({tp: OffsetAndMetadata(message.offset + 1, "", -1)})
+
+
+def _finish(consumer: KafkaConsumer, message, counts: dict, key: str) -> None:
+    _commit(consumer, message)
+    counts[key] += 1
 
 
 def main() -> None:
@@ -110,8 +115,7 @@ def main() -> None:
             logger.error(
                 "undecodable DLQ record at offset %s, skipping", message.offset
             )
-            _commit(consumer, message)
-            counts["skipped"] += 1
+            _finish(consumer, message, counts, "skipped")
             continue
 
         edit = envelope.get("edit")
@@ -130,8 +134,7 @@ def main() -> None:
             logger.warning(
                 "skipping %s envelope at offset %s, raw=%r", reason, message.offset, raw
             )
-            _commit(consumer, message)
-            counts["skipped"] += 1
+            _finish(consumer, message, counts, "skipped")
             continue
 
         try:
@@ -160,8 +163,7 @@ def main() -> None:
                 first_failed_at=envelope.get("first_failed_at"),
             )
             failures.publish(producer, settings.kafka_dlq_topic, out)
-            _commit(consumer, message)
-            counts["requeued"] += 1
+            _finish(consumer, message, counts, "requeued")
             continue
 
         try:
@@ -176,11 +178,9 @@ def main() -> None:
             logger.error(
                 "edit %s does not fit the schema, skipping: %s", edit.get("id"), error
             )
-            _commit(consumer, message)
-            counts["skipped"] += 1
+            _finish(consumer, message, counts, "skipped")
             continue
-        _commit(consumer, message)
-        counts["reclassified"] += 1
+        _finish(consumer, message, counts, "reclassified")
         logger.info(
             "swept edit %s -> %s (%.2f)",
             edit.get("id"),

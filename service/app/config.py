@@ -37,5 +37,9 @@ class Settings(BaseSettings):
     retry_backoff_base_seconds: int = 30
     retry_backoff_max_seconds: int = 120
 
+    @property
+    def kafka_broker_list(self) -> list[str]:
+        return self.kafka_brokers.split(",")
+
 
 settings = Settings()

@@ -27,7 +27,6 @@ import logging
 import time
 from datetime import UTC, datetime
 
-import sqlalchemy.exc
 from kafka import KafkaConsumer
 
 from app import db, failures, infra, routing
@@ -113,20 +112,17 @@ def handle_envelope(client, conn, consumer, producer, breaker, message):
         failures.park_malformed(producer, consumer, message, error, source="retrier")
         return conn
 
-    try:
-        return _handle_edit(
+    return routing.guard_schema_error(
+        conn,
+        consumer,
+        producer,
+        message,
+        edit,
+        "retrier",
+        lambda: _handle_edit(
             client, conn, consumer, producer, breaker, message, envelope, edit, attempts
-        )
-    except sqlalchemy.exc.OperationalError:
-        raise  # connection-level failure even after reconnect: crash, redeliver
-    except sqlalchemy.exc.SQLAlchemyError as error:
-        # Data-shaped failure (edit values don't fit the schema): retrying
-        # the same envelope can never succeed, so park it and move on.
-        logger.warning(
-            "edit %s does not fit the schema -> DLQ: %s", edit.get("id"), error
-        )
-        failures.park_malformed(producer, consumer, message, error, source="retrier")
-        return conn
+        ),
+    )
 
 
 def _handle_edit(
@@ -142,21 +138,9 @@ def _handle_edit(
             "deterministic model failure (bad key/config?), crashing: %s", error
         )
         raise SystemExit(1) from error
-    except ModelUnavailableError as error:
-        attempts += 1  # counts the worker's first pass plus each retrier pass
-        return routing.handle_classifier_failure(
-            error,
-            conn=conn,
-            consumer=consumer,
-            producer=producer,
-            breaker=breaker,
-            message=message,
-            edit=edit,
-            source="retrier",
-            attempts=attempts,
-            first_failed_at=first_failed_at,
-        )
-    except ClassificationParseError as error:
+    except (ModelUnavailableError, ClassificationParseError) as error:
+        if isinstance(error, ModelUnavailableError):
+            attempts += 1  # counts the worker's first pass plus each retrier pass
         return routing.handle_classifier_failure(
             error,
             conn=conn,

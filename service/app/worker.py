@@ -23,7 +23,6 @@ Per-class routing (see classifier.py for the taxonomy):
 import json
 import logging
 
-import sqlalchemy.exc
 from kafka import KafkaConsumer
 
 from app import db, failures, infra, routing
@@ -69,18 +68,15 @@ def handle_message(client, conn, consumer, producer, breaker, message):
         failures.park_malformed(producer, consumer, message, error, source="worker")
         return conn
 
-    try:
-        return _handle_edit(client, conn, consumer, producer, breaker, message, edit)
-    except sqlalchemy.exc.OperationalError:
-        raise  # connection-level failure even after reconnect: crash, redeliver
-    except sqlalchemy.exc.SQLAlchemyError as error:
-        # Data-shaped failure (e.g. byte_delta that isn't an int): retrying
-        # the same message can never succeed, so park it and move on.
-        logger.warning(
-            "edit %s does not fit the schema -> DLQ: %s", edit.get("id"), error
-        )
-        failures.park_malformed(producer, consumer, message, error, source="worker")
-        return conn
+    return routing.guard_schema_error(
+        conn,
+        consumer,
+        producer,
+        message,
+        edit,
+        "worker",
+        lambda: _handle_edit(client, conn, consumer, producer, breaker, message, edit),
+    )
 
 
 def _handle_edit(client, conn, consumer, producer, breaker, message, edit):
