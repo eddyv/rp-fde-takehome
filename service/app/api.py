@@ -13,13 +13,10 @@ import psycopg
 from fastapi import FastAPI, HTTPException, Query
 from psycopg.rows import dict_row
 
-from app.classifier import VALID_LABELS
+from app.classifier import VALID_LABELS, VALID_STATUSES
 from app.config import settings
 
 app = FastAPI(title="wiki-edits")
-
-VALID_STATUSES = {"classified", "failed"}
-
 
 def encode_cursor(processed_at: datetime, edit_id: str) -> str:
     payload = {"p": processed_at.isoformat(), "i": edit_id}

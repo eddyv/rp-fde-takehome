@@ -55,17 +55,18 @@ curl "http://localhost:8000/edits?status=failed&limit=5"
 # pass next_cursor back as ?cursor= (with the same filters) until it is null
 curl "http://localhost:8000/edits?limit=5&cursor=eyJwIjoi..."
 ```
-
-Design note: pagination is a keyset on the composite `(processed_at, id)`
+## Design Notes
+- Pagination is a keyset on the composite `(processed_at, id)`
 (id breaks timestamp ties). A time-ordered UUIDv7 primary key would collapse
 that to a single column, but native `uuidv7()` needs Postgres 18 or an
 extension — we kept Postgres 16 as is for now.
-
-Without a valid API key the worker deliberately **crash-loops** (visible in
+- Without a valid API key the worker deliberately **crash-loops** (visible in
 `docker compose ps`) instead of draining the topic into fake data: a missing
 or rejected key is a deterministic failure, so offsets stay uncommitted and
 every message is redelivered once the key is fixed. See "Failure handling"
 below for the full taxonomy.
+
+## Development
 
 Run the tests (no network, no Docker needed):
 
@@ -73,13 +74,10 @@ Run the tests (no network, no Docker needed):
 uv run pytest
 ```
 
-Integration tests are opt-in: the first spins up real Redpanda + Postgres via
-testcontainers (Docker required), the second runs end-to-end against a local
-Ollama:
+Integration tests are opt-in: the first spins up real Redpanda + Postgres via testcontainers (Docker required), the second runs end-to-end against a local Ollama:
 
 ```sh
-uv run pytest -m "integration and not llm"
-uv run pytest -m llm
+uv run pytest -m "integration"
 ```
 
 Lint / format:
@@ -132,13 +130,13 @@ uv run --directory service mutmut results   # list surviving mutants
 Every failure class has an explicit destination — nothing is silently
 converted into data:
 
-| Class | Detection | Action | Destination |
-|---|---|---|---|
-| Config/deterministic | missing key (SDK `TypeError`); 4xx except 408/409 | log CRITICAL, exit(1), **no commit** | crash loop; redelivered after the fix |
-| Transient exhausted | 429 / 5xx / 408 / 409 / network, after 3 in-process attempts (1s/2s/4s) | `status='failed'` row + envelope, commit, breaker++ | `wiki.edits.retry` |
-| Parse failure | refusal, truncation, or non-conforming output (single call; structured outputs, no format retry) | `status='failed'` row + envelope, commit, breaker reset | `wiki.edits.dlq` |
-| Malformed message | Kafka value isn't JSON | envelope with base64 raw, commit | `wiki.edits.dlq` |
-| Success | — | `status='classified'` row, commit, breaker reset | Postgres |
+| Class                | Detection                                                                                        | Action                                                  | Destination                           |
+| -------------------- | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------- | ------------------------------------- |
+| Config/deterministic | missing key (SDK `TypeError`); 4xx except 408/409                                                | log CRITICAL, exit(1), **no commit**                    | crash loop; redelivered after the fix |
+| Transient exhausted  | 429 / 5xx / 408 / 409 / network, after 3 in-process attempts (1s/2s/4s)                          | `status='failed'` row + envelope, commit, breaker++     | `wiki.edits.retry`                    |
+| Parse failure        | refusal, truncation, or non-conforming output (single call; structured outputs, no format retry) | `status='failed'` row + envelope, commit, breaker reset | `wiki.edits.dlq`                      |
+| Malformed message    | Kafka value isn't JSON                                                                           | envelope with base64 raw, commit                        | `wiki.edits.dlq`                      |
+| Success              | —                                                                                                | `status='classified'` row, commit, breaker reset        | Postgres                              |
 
 The retrier consumes `wiki.edits.retry` continuously: each envelope carries a
 `not_before` timestamp (30s → 60s → 120s cap, computed at publish time), and

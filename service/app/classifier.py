@@ -30,6 +30,8 @@ logger = logging.getLogger(__name__)
 
 VALID_LABELS = {"vandalism", "substantive", "trivia", "unclear"}
 
+VALID_STATUSES = {"classified", "failed"}
+
 # sorted() for deterministic serialization — helps prompt caching and
 # reproducibility. Numeric range constraints are not supported by structured
 # outputs, so confidence bounds are enforced in normalize().
