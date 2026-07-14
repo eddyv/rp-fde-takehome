@@ -1,6 +1,9 @@
 """Row shape and reconnect semantics for the Postgres layer."""
 
+from types import SimpleNamespace
+
 import psycopg
+import pytest
 import sqlalchemy.exc
 from app import db
 from app.classifier import Classification
@@ -226,3 +229,69 @@ def test_read_with_reconnect_also_retries_on_interface_error(monkeypatch):
 
     assert returned is fresh, "InterfaceError must trigger reconnect too"
     assert [sql for sql, _ in fresh.executed] == ["SELECT 1"]
+
+
+def test_connect_retries_until_engine_up_then_returns(monkeypatch):
+    sleeps: list = []
+    monkeypatch.setattr(db.time, "sleep", lambda s: sleeps.append(s))
+    calls: list = []
+    sentinel = SimpleNamespace()
+
+    class FakeEngine:
+        def connect(self):
+            calls.append(())
+            if len(calls) < 3:
+                raise sqlalchemy.exc.OperationalError(
+                    "connect", {}, psycopg.OperationalError("could not connect")
+                )
+            return sentinel
+
+    monkeypatch.setattr(db, "get_engine", lambda: FakeEngine())
+
+    result = db.connect(retries=5, delay=2.0)
+
+    assert result is sentinel
+    assert len(calls) == 3, "two failures then a success"
+    assert sleeps == [2.0, 2.0], "one sleep per failed attempt, none after success"
+
+
+def test_connect_default_retries_and_delay(monkeypatch):
+    # Explicit retries/delay are pinned by the test above; this test is the
+    # only one exercising the *defaults* (retries=30, delay=2.0), mirroring
+    # test_infra.py's equivalent split between explicit-args and defaults.
+    sleeps: list = []
+    monkeypatch.setattr(db.time, "sleep", lambda s: sleeps.append(s))
+    calls: list = []
+
+    class AlwaysFailsEngine:
+        def connect(self):
+            calls.append(())
+            raise sqlalchemy.exc.OperationalError(
+                "connect", {}, psycopg.OperationalError("could not connect")
+            )
+
+    monkeypatch.setattr(db, "get_engine", lambda: AlwaysFailsEngine())
+
+    with pytest.raises(sqlalchemy.exc.OperationalError):
+        db.connect()
+
+    assert len(calls) == 30, "default retries must stay 30"
+    assert sleeps == [2.0] * 29, "default delay must stay 2.0s, none after the last"
+
+
+def test_connect_raises_after_exhausting_retries(monkeypatch):
+    sleeps: list = []
+    monkeypatch.setattr(db.time, "sleep", lambda s: sleeps.append(s))
+
+    class AlwaysFailsEngine:
+        def connect(self):
+            raise sqlalchemy.exc.OperationalError(
+                "connect", {}, psycopg.OperationalError("could not connect")
+            )
+
+    monkeypatch.setattr(db, "get_engine", lambda: AlwaysFailsEngine())
+
+    with pytest.raises(sqlalchemy.exc.OperationalError):
+        db.connect(retries=2, delay=1.0)
+
+    assert sleeps == [1.0], "sleep between attempts, none after the last failure"
