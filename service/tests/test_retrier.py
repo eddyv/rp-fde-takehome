@@ -102,6 +102,39 @@ def test_exhausted_attempts_promote_to_dlq():
     assert consumer.commits == 1
 
 
+def test_connection_error_surviving_reconnect_crashes_not_dlq(monkeypatch):
+    # Both the original and the reconnected conn are still dead: proves the
+    # crash path fires for InterfaceError, not just OperationalError, and
+    # that it is NOT swallowed into a DLQ "malformed" park.
+    import psycopg
+    from app import db
+
+    log: list = []
+    dead = FakeConn(
+        log,
+        fail_with=sqlalchemy.exc.InterfaceError(
+            "stmt", {}, psycopg.InterfaceError("the cursor is closed")
+        ),
+    )
+    still_dead = FakeConn(
+        fail_with=sqlalchemy.exc.InterfaceError(
+            "stmt", {}, psycopg.InterfaceError("the cursor is closed")
+        )
+    )
+    consumer, producer = FakeConsumer(log), FakeProducer(log)
+    breaker = failures.CircuitBreaker(25)
+    message = make_envelope_message()
+
+    monkeypatch.setattr(db, "connect", lambda: still_dead)
+    with pytest.raises(sqlalchemy.exc.InterfaceError):
+        handle_envelope(
+            FakeClient([GOOD_JSON]), dead, consumer, producer, breaker, message
+        )
+
+    assert consumer.commits == 0, "must not commit on a connection-level crash"
+    assert producer.sent == [], "must not park to DLQ — this is not malformed data"
+
+
 def test_success_flips_row_to_classified_and_resets_breaker():
     conn, consumer, producer, breaker, log = make_fixtures()
     breaker.record_failure()

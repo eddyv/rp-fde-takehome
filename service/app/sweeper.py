@@ -170,7 +170,7 @@ def main() -> None:
             conn = db.write_with_reconnect(
                 conn, lambda c, e=edit, r=result: db.upsert_edit(c, e, r)
             )
-        except sqlalchemy.exc.OperationalError:
+        except db.CONNECTION_ERRORS:
             raise  # connection-level failure even after reconnect: abort
         except sqlalchemy.exc.SQLAlchemyError as error:
             # Data-shaped failure: this record can never be persisted; skip

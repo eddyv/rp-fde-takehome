@@ -149,6 +149,21 @@ def test_write_with_reconnect_swallows_a_failing_close_on_the_broken_conn(monkey
     assert [sql for sql, _ in fresh.executed] == ["SELECT 1"]
 
 
+def test_write_with_reconnect_also_retries_on_interface_error(monkeypatch):
+    dead = FakeConn(
+        fail_with=sqlalchemy.exc.InterfaceError(
+            "stmt", {}, psycopg.InterfaceError("the cursor is closed")
+        )
+    )
+    fresh = FakeConn()
+    monkeypatch.setattr(db, "connect", lambda: fresh)
+
+    returned = db.write_with_reconnect(dead, lambda c: c.execute("SELECT 1"))
+
+    assert returned is fresh, "InterfaceError must trigger reconnect too"
+    assert [sql for sql, _ in fresh.executed] == ["SELECT 1"]
+
+
 def test_read_with_reconnect_returns_same_conn_and_result_on_success():
     conn = FakeConn(statuses={"42": "failed"})
 
@@ -189,4 +204,25 @@ def test_read_with_reconnect_swallows_a_failing_close_on_the_broken_conn(monkeyp
 
     assert dead.closed, "close must still be attempted"
     assert returned is fresh
+    assert [sql for sql, _ in fresh.executed] == ["SELECT 1"]
+
+
+def test_read_with_reconnect_also_retries_on_interface_error(monkeypatch):
+    # Deviation from the plan's draft: db.fetch_edit_status compiles to
+    # STATUS_STMT, which FakeConn.execute special-cases to bypass fail_with
+    # (see fakes.py's FakeConn docstring), so it can never observe the
+    # injected failure. Mirror the existing OperationalError read-reconnect
+    # test's shape instead (c.execute("SELECT 1")) to actually exercise the
+    # fail_with path.
+    dead = FakeConn(
+        fail_with=sqlalchemy.exc.InterfaceError(
+            "stmt", {}, psycopg.InterfaceError("the cursor is closed")
+        )
+    )
+    fresh = FakeConn()
+    monkeypatch.setattr(db, "connect", lambda: fresh)
+
+    returned, _ = db.read_with_reconnect(dead, lambda c: c.execute("SELECT 1"))
+
+    assert returned is fresh, "InterfaceError must trigger reconnect too"
     assert [sql for sql, _ in fresh.executed] == ["SELECT 1"]

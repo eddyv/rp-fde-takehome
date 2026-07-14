@@ -320,6 +320,34 @@ def test_missing_end_offset_snapshot_pauses_instead_of_processing(monkeypatch):
     assert consumer.committed == {}
 
 
+def test_connection_error_surviving_reconnect_crashes_not_dlq(monkeypatch):
+    # db.connect is monkeypatched to always return this same FakeConn (both
+    # for the initial db.connect() and for _reconnect()'s call to connect()),
+    # so a persistently-failing conn means the retried write after reconnect
+    # fails too -- proving the crash path fires for InterfaceError, not just
+    # OperationalError, and is NOT swallowed into a DLQ envelope/skip.
+    conn = FakeConn(
+        fail_with=sqlalchemy.exc.InterfaceError(
+            "stmt", {}, psycopg.InterfaceError("the cursor is closed")
+        )
+    )
+    consumer = FakeSweeperConsumer([dlq_message(offset=0)])
+    client = FakeClient([GOOD_JSON])
+    producer = FakeProducer()
+
+    monkeypatch.setattr("sys.argv", ["sweeper"])
+    monkeypatch.setattr(infra, "Anthropic", lambda **kwargs: client)
+    monkeypatch.setattr(db, "connect", lambda: conn)
+    monkeypatch.setattr(sweeper, "make_consumer", lambda: consumer)
+    monkeypatch.setattr(failures, "make_producer", lambda: producer)
+
+    with pytest.raises(sqlalchemy.exc.InterfaceError):
+        sweeper.main()
+
+    assert consumer.committed == {}, "must not commit on a connection-level crash"
+    assert producer.sent == [], "must not park to DLQ — this is not malformed data"
+
+
 def test_schema_mismatch_rows_are_skipped_so_the_dlq_stays_drainable(monkeypatch):
     conn = FakeConn(
         fail_with=sqlalchemy.exc.DataError(

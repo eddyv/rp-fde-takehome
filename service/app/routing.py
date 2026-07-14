@@ -138,7 +138,7 @@ def guard_schema_error(conn, consumer, producer, message, edit, source: str, run
     """
     try:
         return run()
-    except sqlalchemy.exc.OperationalError:
+    except db.CONNECTION_ERRORS:
         raise
     except sqlalchemy.exc.SQLAlchemyError as error:
         logger.warning(

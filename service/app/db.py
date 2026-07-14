@@ -22,6 +22,13 @@ from app.models import Edit
 
 logger = logging.getLogger(__name__)
 
+# Connection-level failures worth reconnecting for (and, if reconnect also
+# fails, crashing so Kafka redelivers) rather than parking as malformed data.
+# InterfaceError is a *sibling* of OperationalError, not a subclass (verified
+# via issubclass() against both sqlalchemy.exc and psycopg) — psycopg raises
+# it for e.g. "the cursor is closed" after a connection has already died.
+CONNECTION_ERRORS = (sqlalchemy.exc.OperationalError, sqlalchemy.exc.InterfaceError)
+
 
 def normalize_dsn(dsn: str) -> str:
     """SQLAlchemy's plain postgresql:// scheme means psycopg2; we ship psycopg 3."""
@@ -189,7 +196,7 @@ def write_with_reconnect(
     """Run a write, reconnecting once if Postgres dropped the connection."""
     try:
         write(conn)
-    except sqlalchemy.exc.OperationalError:
+    except CONNECTION_ERRORS:
         conn = _reconnect(conn)
         write(conn)
     return conn
@@ -201,6 +208,6 @@ def read_with_reconnect[T](
     """Run a read, reconnecting once if Postgres dropped the connection."""
     try:
         return conn, read(conn)
-    except sqlalchemy.exc.OperationalError:
+    except CONNECTION_ERRORS:
         conn = _reconnect(conn)
         return conn, read(conn)
