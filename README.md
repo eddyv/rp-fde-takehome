@@ -65,6 +65,15 @@ curl "http://localhost:8000/stats"
 # {"total": ..., "by_label": {...}, "by_status": {...}} — label/status counts
 ```
 
+Browse `/edits` interactively instead of hand-copying cursors:
+
+```sh
+uv run --directory service edits-tui
+# EDITS_API_URL=http://localhost:8000 (default) — override if the API is elsewhere
+# n next page, p previous page, r reset, arrow keys scroll the table's columns
+# (free-text columns are last) — enter on a row shows the full record
+```
+
 ## Development
 
 ```sh

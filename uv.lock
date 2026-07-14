@@ -821,10 +821,12 @@ dependencies = [
     { name = "anthropic" },
     { name = "fastapi" },
     { name = "fastapi-pagination", extra = ["sqlalchemy"] },
+    { name = "httpx" },
     { name = "kafka-python" },
     { name = "psycopg", extra = ["binary"] },
     { name = "pydantic-settings" },
     { name = "sqlalchemy" },
+    { name = "textual" },
     { name = "uvicorn" },
 ]
 
@@ -833,10 +835,12 @@ requires-dist = [
     { name = "anthropic", specifier = "==0.116.0" },
     { name = "fastapi", specifier = "==0.139.0" },
     { name = "fastapi-pagination", extras = ["sqlalchemy"], specifier = "==0.15.15" },
+    { name = "httpx", specifier = "==0.28.1" },
     { name = "kafka-python", specifier = "==3.0.7" },
     { name = "psycopg", extras = ["binary"], specifier = "==3.3.4" },
     { name = "pydantic-settings", specifier = "==2.14.2" },
     { name = "sqlalchemy", specifier = "==2.0.51" },
+    { name = "textual", specifier = "==8.2.8" },
     { name = "uvicorn", specifier = "==0.51.0" },
 ]
 

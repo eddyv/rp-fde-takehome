@@ -12,7 +12,12 @@ dependencies = [
     "pydantic-settings==2.14.2",
     "sqlalchemy==2.0.51",
     "fastapi-pagination[sqlalchemy]==0.15.15",
+    "httpx==0.28.1",
+    "textual==8.2.8",
 ]
+
+[project.scripts]
+edits-tui = "app.tui:main"
 
 # Without an explicit testpaths, a bare `pytest` from this directory also
 # collects mutmut's mutants/tests copy and dies on an import mismatch.
