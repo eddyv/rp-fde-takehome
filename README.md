@@ -93,6 +93,12 @@ uv run ruff check . --fix
 uv run ruff format
 ```
 
+Type check (scoped to `service/app` — the test tier passes fakes where SDK types are expected, so it's excluded on purpose):
+
+```sh
+uv run ty check service/app
+```
+
 Mutation testing (~30s; `--directory service` because mutmut must run where
 the `app` package lives — see the comment in `service/pyproject.toml`):
 

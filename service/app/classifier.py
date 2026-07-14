@@ -35,7 +35,7 @@ VALID_STATUSES = {"classified", "failed"}
 # sorted() for deterministic serialization — helps prompt caching and
 # reproducibility. Numeric range constraints are not supported by structured
 # outputs, so confidence bounds are enforced in normalize().
-OUTPUT_SCHEMA = {
+OUTPUT_SCHEMA: dict[str, object] = {
     "type": "object",
     "properties": {
         "label": {"type": "string", "enum": sorted(VALID_LABELS)},
