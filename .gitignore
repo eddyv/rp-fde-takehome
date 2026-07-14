@@ -17,3 +17,6 @@ wheels/
 mutants/
 
 .vscode/
+
+# Upstream exercise material, not repo docs (see plans/001-fix-doc-drift.md)
+TAKEHOME.md
