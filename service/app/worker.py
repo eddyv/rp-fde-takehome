@@ -42,7 +42,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 # Model calls are bounded (see main: request timeout 60s; classify makes at
-# most 9 calls plus seconds of backoff), so per-message time stays under this.
+# most 6 calls (3 bounded attempts × first + optional second pass) plus
+# seconds of backoff), so per-message time stays under this.
 # The kafka-python default (300s) is too tight for a slow multi-pass classify.
 MAX_POLL_INTERVAL_MS = 600_000
 
