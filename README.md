@@ -80,7 +80,7 @@ Run the tests (no network, no Docker needed):
 uv run pytest
 ```
 
-Integration tests are opt-in: the first spins up real Redpanda + Postgres via testcontainers (Docker required), the second runs end-to-end against a local Ollama:
+Integration tests are opt-in: spins up  Redpanda + Postgres + Ollama via testcontainers (Docker required)
 
 ```sh
 uv run pytest -m "integration"
@@ -245,4 +245,24 @@ spend tracks human article edits, not bot churn.
 
 ## Tradeoffs
 
-TODO — to be written by the author.
+### One topic with a label column vs. topic-per-label routing
+
+Chose one topic with a label column.
+
+In general, event streams are easier to split than to piece back together. A raw events stream in Redpanda can easily be split into **topic-per-label** downstream using microservices or any stream processing layer of choice.
+
+This also leans into the **medallion architecture** pattern: data lands raw in the lakehouse (bronze), gets cleaned/augmented into a new stream (silver), then aggregated into business-level views (gold).
+
+I'd choose topic-per-label routing upfront only if we know events of different labels never need to be processed in order relative to each other. i.e., labels are mutually exclusive, split by label.
+
+This exercise is also simple enough that it doesn't carry the consistency requirements of a more serious system like payment or order processing. Were this a **saga-based system**, I'd introduce a workflow orchestrator like **Temporal**, to make resume/replay/recovery of events straightforward.
+
+### How you bound LLM cost/latency — filter in Connect first, batch in the service, or gate on confidence
+
+Primarily done through filters in Connect first, excluding events deemed not interesting (e.g., bots).
+
+LLMs carry real cost and latency overhead, so in production I'd scrutinize whether every event needs one. Traditional rule-based classification should be the first pass, only route to an LLM when rules are insufficient or return low confidence, i.e. falling back to the LLM only when our confidence threshold is below a value.
+
+Currently, topics are configured to be single partitioned and the latency for processing each individual event can cause a fiar amount of consumer lag. Setting a proper partition count along with parallelized workers could decrease our overall processing speed (or routing to local LLMs / faster models).
+
+Beyond the data itself, I'd weigh required freshness. **[Message Batch APIs](https://platform.claude.com/docs/en/build-with-claude/batch-processing)** cut cost at the expense of latency. Not suitable at this exercise's volume, but worth considering in production.
