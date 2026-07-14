@@ -62,6 +62,20 @@ def test_missing_api_key_typeerror_is_config_error():
     assert len(client.calls) == 1, "deterministic failure must not be retried"
 
 
+def test_unrelated_typeerror_propagates_as_itself():
+    # e.g. an SDK version that rejects the output_config kwarg: crashing is
+    # right (deterministic, must not be swallowed), but it must crash as a
+    # TypeError with a real traceback, not as "bad key/config".
+    client = FakeClient(
+        [TypeError("create() got an unexpected keyword argument 'output_config'")]
+    )
+
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        classify(client, EDIT)
+
+    assert len(client.calls) == 1, "deterministic failure must not be retried"
+
+
 def test_401_is_config_error_after_exactly_one_call():
     client = FakeClient([make_status_error(401)])
 

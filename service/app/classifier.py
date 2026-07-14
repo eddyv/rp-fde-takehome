@@ -140,7 +140,11 @@ def call_model(client: anthropic.Anthropic, prompt: str, model: str):
         except TypeError as error:
             # The SDK raises TypeError at request time when no API key is
             # configured — deterministic, so crash loudly instead of retrying.
-            raise ModelConfigError(str(error)) from error
+            # Any other TypeError is a genuine bug (e.g. an SDK signature
+            # mismatch) and must surface as itself, not as "fix your .env".
+            if "could not resolve authentication method" in str(error).lower():
+                raise ModelConfigError(str(error)) from error
+            raise
         except anthropic.APIStatusError as error:
             # 408/409 are retryable per Anthropic docs; other 4xx are not.
             if error.status_code >= 500 or error.status_code in (408, 409):
