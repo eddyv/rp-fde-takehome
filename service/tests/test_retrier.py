@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 import app.retrier as retrier
 import pytest
+import sqlalchemy.exc
 from app import failures
 from app.config import settings
 from app.retrier import handle_envelope, wait_until
@@ -251,7 +252,14 @@ def test_schema_mismatch_row_goes_to_dlq_as_malformed():
     import psycopg
 
     log: list = []
-    conn = FakeConn(log, fail_with=psycopg.DataError("invalid input for type integer"))
+    conn = FakeConn(
+        log,
+        fail_with=sqlalchemy.exc.DataError(
+            "INSERT INTO edits ...",
+            {},
+            psycopg.DataError("invalid input for type integer"),
+        ),
+    )
     consumer, producer = FakeConsumer(log), FakeProducer(log)
     breaker = failures.CircuitBreaker(25)
     message = make_envelope_message()

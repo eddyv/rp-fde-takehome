@@ -23,7 +23,7 @@ Per-class routing (see classifier.py for the taxonomy):
 import json
 import logging
 
-import psycopg
+import sqlalchemy.exc
 from kafka import KafkaConsumer
 
 from app import db, failures, infra, routing
@@ -71,9 +71,9 @@ def handle_message(client, conn, consumer, producer, breaker, message):
 
     try:
         return _handle_edit(client, conn, consumer, producer, breaker, message, edit)
-    except psycopg.OperationalError:
+    except sqlalchemy.exc.OperationalError:
         raise  # connection-level failure even after reconnect: crash, redeliver
-    except psycopg.Error as error:
+    except sqlalchemy.exc.SQLAlchemyError as error:
         # Data-shaped failure (e.g. byte_delta that isn't an int): retrying
         # the same message can never succeed, so park it and move on.
         logger.warning(

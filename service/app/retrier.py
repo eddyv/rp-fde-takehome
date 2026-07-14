@@ -27,7 +27,7 @@ import logging
 import time
 from datetime import UTC, datetime
 
-import psycopg
+import sqlalchemy.exc
 from kafka import KafkaConsumer
 
 from app import db, failures, infra, routing
@@ -117,9 +117,9 @@ def handle_envelope(client, conn, consumer, producer, breaker, message):
         return _handle_edit(
             client, conn, consumer, producer, breaker, message, envelope, edit, attempts
         )
-    except psycopg.OperationalError:
+    except sqlalchemy.exc.OperationalError:
         raise  # connection-level failure even after reconnect: crash, redeliver
-    except psycopg.Error as error:
+    except sqlalchemy.exc.SQLAlchemyError as error:
         # Data-shaped failure (edit values don't fit the schema): retrying
         # the same envelope can never succeed, so park it and move on.
         logger.warning(

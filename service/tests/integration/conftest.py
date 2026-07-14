@@ -22,14 +22,14 @@ import uuid
 from pathlib import Path
 
 import docker
-import psycopg
 import pytest
 from app import db, failures, retrier, worker
 from app.config import settings
 from kafka import KafkaConsumer, KafkaProducer, TopicPartition
 from kafka.admin import KafkaAdminClient, NewTopic
 from kafka.errors import TopicAlreadyExistsError
-from psycopg.rows import dict_row
+from sqlalchemy import create_engine, text
+from sqlalchemy.pool import NullPool
 from testcontainers.kafka import RedpandaContainer
 from testcontainers.postgres import PostgresContainer
 
@@ -85,8 +85,10 @@ def kafka_bootstrap():
 def postgres_dsn():
     with PostgresContainer("postgres:16", driver=None) as postgres:
         dsn = postgres.get_connection_url()
-        with psycopg.connect(dsn, autocommit=True) as conn:
-            conn.execute(SCHEMA_SQL.read_text())
+        engine = create_engine(db.normalize_dsn(dsn), isolation_level="AUTOCOMMIT")
+        with engine.connect() as conn:
+            conn.exec_driver_sql(SCHEMA_SQL.read_text())  # multi-statement DDL
+        engine.dispose()
         yield dsn
 
 
@@ -190,18 +192,34 @@ def wire_settings(request, kafka_bootstrap, postgres_dsn, monkeypatch):
 
 @pytest.fixture
 def pg_conn(postgres_dsn):
-    """Real psycopg connection, rows as dicts; table truncated per test."""
-    conn = psycopg.connect(postgres_dsn, autocommit=True, row_factory=dict_row)
-    conn.execute("TRUNCATE edits")
-    try:
+    """Real SQLAlchemy connection (AUTOCOMMIT); table truncated per test."""
+    engine = create_engine(
+        db.normalize_dsn(postgres_dsn),
+        isolation_level="AUTOCOMMIT",
+        poolclass=NullPool,
+    )
+    with engine.connect() as conn:
+        conn.execute(text("TRUNCATE edits"))
         yield conn
-    finally:
-        conn.close()
+    engine.dispose()
 
 
 # --------------------------------------------------------------------------
 # Harness helpers
 # --------------------------------------------------------------------------
+
+
+def fetch_edit_row(pg_conn, edit_id: str) -> dict | None:
+    row = (
+        pg_conn.execute(text("SELECT * FROM edits WHERE id = :id"), {"id": edit_id})
+        .mappings()
+        .fetchone()
+    )
+    return dict(row) if row is not None else None
+
+
+def count_edits(pg_conn) -> int:
+    return pg_conn.execute(text("SELECT count(*) FROM edits")).scalar_one()
 
 
 def make_raw_producer() -> KafkaProducer:
@@ -272,7 +290,9 @@ def read_envelopes(
         consumer.close()
 
 
-def read_records(topic: str, expected_count: int, timeout: float = POLL_TIMEOUT_SECONDS):
+def read_records(
+    topic: str, expected_count: int, timeout: float = POLL_TIMEOUT_SECONDS
+):
     """Read up to `expected_count` raw ConsumerRecords from `topic` (fresh
     reader group, from the beginning), polling until the count is reached or
     the deadline passes.

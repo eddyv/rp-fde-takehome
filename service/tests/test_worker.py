@@ -6,7 +6,8 @@ from datetime import UTC, datetime
 
 import psycopg
 import pytest
-from app import failures
+import sqlalchemy.exc
+from app import db, failures
 from app.config import settings
 from app.worker import handle_message
 
@@ -82,7 +83,14 @@ def test_schema_mismatch_row_goes_to_dlq_as_malformed():
     # e.g. byte_delta that isn't an int: psycopg raises a DataError (not
     # OperationalError) — retrying can never help, so park + commit.
     log: list = []
-    conn = FakeConn(log, fail_with=psycopg.DataError("invalid input for type integer"))
+    conn = FakeConn(
+        log,
+        fail_with=sqlalchemy.exc.DataError(
+            "INSERT INTO edits ...",
+            {},
+            psycopg.DataError("invalid input for type integer"),
+        ),
+    )
     consumer, producer = FakeConsumer(log), FakeProducer(log)
     breaker = failures.CircuitBreaker(25)
     message = make_message(json.dumps(EDIT).encode())
@@ -105,7 +113,7 @@ def test_transient_exhaustion_failed_row_then_retry_publish_then_commit():
     handle_message(client, conn, consumer, producer, breaker, message)
 
     [(sql, params)] = conn.executed
-    assert "status IS DISTINCT FROM 'classified'" in sql
+    assert sql is db.FAILED_UPSERT_STMT
     assert params["reasoning"].startswith("failed (transient_exhausted)")
     assert "http 429" in params["reasoning"], "the row carries the upstream error"
     [sent] = producer.sent

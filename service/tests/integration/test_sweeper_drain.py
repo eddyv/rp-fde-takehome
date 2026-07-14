@@ -33,7 +33,9 @@ from app.config import settings
 from tests.fakes import FakeClient, make_message, make_status_error
 from tests.integration.conftest import (
     committed_offset,
+    count_edits,
     end_offset,
+    fetch_edit_row,
     produce,
     read_records,
     seed_envelope,
@@ -62,7 +64,9 @@ STILL_FAILING_EDIT = {
 }
 
 
-def test_sweeper_reclassifies_requeues_skips_and_stops_at_boundary(pg_conn, monkeypatch):
+def test_sweeper_reclassifies_requeues_skips_and_stops_at_boundary(
+    pg_conn, monkeypatch
+):
     # Seed the DLQ in a deterministic offset order (topic has 1 partition, and
     # each produce() is broker-acked before the next):
     #   0: reclassifiable (parse_failed edit)     -> classify -> classified row
@@ -137,9 +141,7 @@ def test_sweeper_reclassifies_requeues_skips_and_stops_at_boundary(pg_conn, monk
     # 1) The reclassifiable edit is now a full classified row, tagged with the
     #    sweep model override (proving --model/sweeper_model actually selects
     #    the classifier model, not the default).
-    row = pg_conn.execute(
-        "SELECT * FROM edits WHERE id = %s", (RECLASSIFY_EDIT["id"],)
-    ).fetchone()
+    row = fetch_edit_row(pg_conn, RECLASSIFY_EDIT["id"])
     assert row is not None and row["status"] == "classified"
     assert row["label"] == "substantive"
     assert row["model"] == "sweep-test-model"
@@ -149,13 +151,8 @@ def test_sweeper_reclassifies_requeues_skips_and_stops_at_boundary(pg_conn, monk
     # 2) The still-failing edit was requeued, never persisted -- the sweeper
     #    writes a row only on success. And no skipped/malformed record wrote a
     #    row either: exactly one row exists in total.
-    assert (
-        pg_conn.execute(
-            "SELECT * FROM edits WHERE id = %s", (STILL_FAILING_EDIT["id"],)
-        ).fetchone()
-        is None
-    )
-    assert pg_conn.execute("SELECT count(*) AS n FROM edits").fetchone()["n"] == 1
+    assert fetch_edit_row(pg_conn, STILL_FAILING_EDIT["id"]) is None
+    assert count_edits(pg_conn) == 1
 
     # 3) The group committed exactly up to the snapshot boundary; the requeued
     #    tail (offset == boundary) stays uncommitted for the next sweep.

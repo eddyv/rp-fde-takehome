@@ -23,6 +23,7 @@ from app.config import settings
 
 from tests.integration.conftest import (
     OLLAMA_MODEL,
+    fetch_edit_row,
     produce,
     read_envelopes,
     run_worker_once,
@@ -71,7 +72,7 @@ def test_pipeline_e2e_real_ollama(pg_conn, ollama_base_url, monkeypatch):
         "offset must be committed on every terminal path"
     )
 
-    row = pg_conn.execute("SELECT * FROM edits WHERE id = %s", (edit["id"],)).fetchone()
+    row = fetch_edit_row(pg_conn, edit["id"])
     assert row is not None, "a row must exist for the edit id on every terminal path"
 
     if row["status"] == "classified":

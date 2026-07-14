@@ -9,6 +9,7 @@ import json
 
 import psycopg
 import pytest
+import sqlalchemy.exc
 from app import db, failures, infra, sweeper
 from app.config import settings
 from kafka import TopicPartition
@@ -320,7 +321,13 @@ def test_missing_end_offset_snapshot_pauses_instead_of_processing(monkeypatch):
 
 
 def test_schema_mismatch_rows_are_skipped_so_the_dlq_stays_drainable(monkeypatch):
-    conn = FakeConn(fail_with=psycopg.DataError("invalid input for type integer"))
+    conn = FakeConn(
+        fail_with=sqlalchemy.exc.DataError(
+            "INSERT INTO edits ...",
+            {},
+            psycopg.DataError("invalid input for type integer"),
+        )
+    )
     consumer = FakeSweeperConsumer([dlq_message(offset=0), dlq_message(offset=1)])
 
     producer = run_sweeper(

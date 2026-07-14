@@ -9,8 +9,11 @@ the query itself.
 """
 
 import pytest
+import sqlalchemy.exc
 from app import db
 from app.classifier import Classification
+
+from tests.integration.conftest import fetch_edit_row
 
 pytestmark = pytest.mark.integration
 
@@ -32,9 +35,7 @@ def test_failed_upsert_never_downgrades_a_classified_row(pg_conn):
     # A stale/redelivered failure for the same id must be a no-op.
     db.upsert_failed_edit(pg_conn, EDIT, "transient_exhausted", "http 500")
 
-    row = pg_conn.execute(
-        "SELECT * FROM edits WHERE id = %s", (EDIT["id"],)
-    ).fetchone()
+    row = fetch_edit_row(pg_conn, EDIT["id"])
     assert row["status"] == "classified", "the guard must block the downgrade"
     assert row["label"] == "substantive"
     assert row["confidence"] == pytest.approx(0.91)
@@ -44,18 +45,49 @@ def test_failed_upsert_never_downgrades_a_classified_row(pg_conn):
 
 def test_success_upgrades_a_failed_row(pg_conn):
     db.upsert_failed_edit(pg_conn, EDIT, "parse_failed", "unusable output")
-    seeded = pg_conn.execute(
-        "SELECT * FROM edits WHERE id = %s", (EDIT["id"],)
-    ).fetchone()
+    seeded = fetch_edit_row(pg_conn, EDIT["id"])
     assert seeded["status"] == "failed" and seeded["label"] is None
 
     db.upsert_edit(
         pg_conn, EDIT, Classification("trivia", 0.4, "typo fix", "test-model")
     )
 
-    row = pg_conn.execute(
-        "SELECT * FROM edits WHERE id = %s", (EDIT["id"],)
-    ).fetchone()
+    row = fetch_edit_row(pg_conn, EDIT["id"])
     assert row["status"] == "classified", "a success must be allowed to upgrade"
     assert row["label"] == "trivia"
     assert row["model"] == "test-model"
+
+
+def test_dataerror_rolls_back_so_the_connection_stays_usable(pg_conn):
+    """Even under AUTOCOMMIT, SQLAlchemy tracks an implicit transaction; without
+    `_execute`'s rollback, a DBAPIError leaves the connection unusable -- every
+    later statement raises PendingRollbackError, a failure mode raw psycopg
+    autocommit never had."""
+    poison = {
+        "id": "guard-2",
+        "title": "X",
+        "comment": "",
+        "byte_delta": "lots",  # not an int: Postgres raises a DataError
+    }
+    good = {
+        "id": "guard-3",
+        "title": "Y",
+        "user": "Bob",
+        "comment": "",
+        "byte_delta": 1,
+        "event_time": "2026-07-01T00:00:00+00:00",
+    }
+    conn = db.connect()
+    try:
+        with pytest.raises(sqlalchemy.exc.DBAPIError):
+            db.upsert_edit(
+                conn, poison, Classification("trivia", 0.5, "n/a", "test-model")
+            )
+
+        # The same connection must still be usable after the error.
+        db.upsert_edit(conn, good, Classification("trivia", 0.6, "fine", "test-model"))
+    finally:
+        conn.close()
+
+    row = fetch_edit_row(pg_conn, good["id"])
+    assert row is not None and row["status"] == "classified"

@@ -7,6 +7,7 @@ import pytest
 from app import api, db
 from app.classifier import Classification
 from fastapi.testclient import TestClient
+from sqlalchemy import text
 
 pytestmark = pytest.mark.integration
 
@@ -33,8 +34,16 @@ BASE_TIME = datetime(2026, 7, 1, tzinfo=UTC)
 def seed_edit(pg_conn, edit_id, processed_at, label="trivia", status="classified"):
     """db.upsert_edit hardcodes processed_at = now(), so insert directly."""
     pg_conn.execute(
-        "INSERT INTO edits (id, label, status, processed_at) VALUES (%s, %s, %s, %s)",
-        (edit_id, label if status == "classified" else None, status, processed_at),
+        text(
+            "INSERT INTO edits (id, label, status, processed_at) "
+            "VALUES (:id, :label, :status, :processed_at)"
+        ),
+        {
+            "id": edit_id,
+            "label": label if status == "classified" else None,
+            "status": status,
+            "processed_at": processed_at,
+        },
     )
 
 

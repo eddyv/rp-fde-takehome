@@ -116,15 +116,19 @@ class FakeConn:
         log: list | None = None,
         fail_with: Exception | None = None,
         statuses: dict[str, str] | None = None,
+        fail_close_with: Exception | None = None,
     ):
         self.executed: list[tuple[str, dict]] = []
         self.status_reads: list[str] = []
         self.log = log if log is not None else []
         self.fail_with = fail_with
         self.statuses = statuses if statuses is not None else {}
+        self.rollbacks = 0
+        self.fail_close_with = fail_close_with
+        self.closed = False
 
     def execute(self, sql, params=None):
-        if sql is db.STATUS_SQL:
+        if sql is db.STATUS_STMT:
             self.status_reads.append(params["id"])
             row = (
                 (self.statuses[params["id"]],)
@@ -136,6 +140,14 @@ class FakeConn:
             raise self.fail_with
         self.executed.append((sql, params))
         self.log.append(("db",))
+
+    def rollback(self) -> None:
+        self.rollbacks += 1
+
+    def close(self) -> None:
+        self.closed = True
+        if self.fail_close_with is not None:
+            raise self.fail_close_with
 
 
 def make_message(

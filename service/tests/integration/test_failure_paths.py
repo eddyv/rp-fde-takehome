@@ -10,9 +10,12 @@ import pytest
 from app import db
 from app.classifier import Classification
 from app.config import settings
+from sqlalchemy import text
 
 from tests.fakes import FakeClient, make_status_error
 from tests.integration.conftest import (
+    count_edits,
+    fetch_edit_row,
     produce,
     read_envelopes,
     run_retrier_once,
@@ -46,9 +49,7 @@ def test_worker_happy_path_writes_full_row_and_skips_classified_redelivery(pg_co
     message, committed = run_worker_once(FakeClient([GOOD_JSON]))
 
     assert committed is not None and committed == message.offset + 1
-    row = pg_conn.execute(
-        "SELECT * FROM edits WHERE id = %s", (FULL_EDIT["id"],)
-    ).fetchone()
+    row = fetch_edit_row(pg_conn, FULL_EDIT["id"])
     assert row["status"] == "classified"
     assert row["title"] == "Anarchism"
     assert row["editor"] == "Alice"  # edit["user"] maps to the editor column
@@ -72,15 +73,11 @@ def test_worker_happy_path_writes_full_row_and_skips_classified_redelivery(pg_co
     assert client2.calls == [], (
         "an already-classified redelivery must not re-burn the LLM"
     )
-    row2 = pg_conn.execute(
-        "SELECT * FROM edits WHERE id = %s", (FULL_EDIT["id"],)
-    ).fetchone()
+    row2 = fetch_edit_row(pg_conn, FULL_EDIT["id"])
     assert row2["processed_at"] == first_processed_at, (
         "the skip path must not rewrite the row"
     )
-    assert pg_conn.execute("SELECT count(*) AS n FROM edits").fetchone()["n"] == 1, (
-        "redelivery must not create a second row"
-    )
+    assert count_edits(pg_conn) == 1, "redelivery must not create a second row"
 
     # The pre-check hides the UPSERT's ON CONFLICT DO UPDATE from worker
     # redelivery, but retrier and sweeper still upsert_edit onto ids that may
@@ -93,13 +90,11 @@ def test_worker_happy_path_writes_full_row_and_skips_classified_redelivery(pg_co
         FULL_EDIT,
         Classification("substantive", 0.9, "refreshed", "test-model"),
     )
-    row3 = pg_conn.execute(
-        "SELECT * FROM edits WHERE id = %s", (FULL_EDIT["id"],)
-    ).fetchone()
+    row3 = fetch_edit_row(pg_conn, FULL_EDIT["id"])
     assert row3["processed_at"] > first_processed_at, (
         "ON CONFLICT DO UPDATE must re-run for an existing id, not raise"
     )
-    assert pg_conn.execute("SELECT count(*) AS n FROM edits").fetchone()["n"] == 1
+    assert count_edits(pg_conn) == 1
 
 
 def test_schema_mismatch_parks_to_dlq_with_real_psycopg_error(pg_conn):
@@ -124,10 +119,7 @@ def test_schema_mismatch_parks_to_dlq_with_real_psycopg_error(pg_conn):
     assert envelope["reason"] == "malformed"
     assert "invalid input syntax" in envelope["error"]
     assert json.loads(base64.b64decode(envelope["raw"])) == poison
-    assert (
-        pg_conn.execute("SELECT * FROM edits WHERE id = %s", (poison["id"],)).fetchone()
-        is None
-    )
+    assert fetch_edit_row(pg_conn, poison["id"]) is None
 
 
 def test_transient_exhaustion_goes_to_retry_topic_and_failed_row(pg_conn):
@@ -139,7 +131,7 @@ def test_transient_exhaustion_goes_to_retry_topic_and_failed_row(pg_conn):
     assert committed is not None and committed == message.offset + 1, (
         "offset must be committed on the transient-exhausted path"
     )
-    row = pg_conn.execute("SELECT * FROM edits WHERE id = %s", (EDIT["id"],)).fetchone()
+    row = fetch_edit_row(pg_conn, EDIT["id"])
     assert row["status"] == "failed"
 
     [envelope] = read_envelopes(settings.kafka_retry_topic)
@@ -160,7 +152,7 @@ def test_malformed_payload_goes_to_dlq_with_raw_bytes_and_no_db_row(pg_conn):
     [envelope] = read_envelopes(settings.kafka_dlq_topic)
     assert envelope["reason"] == "malformed"
     assert base64.b64decode(envelope["raw"]) == b"not json {"
-    assert pg_conn.execute("SELECT * FROM edits").fetchall() == []
+    assert pg_conn.execute(text("SELECT * FROM edits")).fetchall() == []
 
 
 def test_parse_failure_goes_to_dlq_and_failed_row(pg_conn):
@@ -170,7 +162,7 @@ def test_parse_failure_goes_to_dlq_and_failed_row(pg_conn):
     message, committed = run_worker_once(client)
 
     assert committed is not None and committed == message.offset + 1
-    row = pg_conn.execute("SELECT * FROM edits WHERE id = %s", (EDIT["id"],)).fetchone()
+    row = fetch_edit_row(pg_conn, EDIT["id"])
     assert row["status"] == "failed"
     [envelope] = read_envelopes(settings.kafka_dlq_topic)
     assert envelope["reason"] == "parse_failed"
@@ -194,7 +186,7 @@ def test_retrier_promotes_exhausted_retries_to_dlq(pg_conn, monkeypatch):
     message, committed = run_retrier_once(client)
 
     assert committed is not None and committed == message.offset + 1
-    row = pg_conn.execute("SELECT * FROM edits WHERE id = %s", (EDIT["id"],)).fetchone()
+    row = fetch_edit_row(pg_conn, EDIT["id"])
     assert row["status"] == "failed"
 
     [envelope] = read_envelopes(settings.kafka_dlq_topic)
@@ -207,9 +199,7 @@ def test_retrier_promotes_exhausted_retries_to_dlq(pg_conn, monkeypatch):
 
 def test_retrier_success_flips_failed_row_to_classified(pg_conn):
     db.upsert_failed_edit(pg_conn, EDIT, "transient_exhausted", "http 500")
-    seeded = pg_conn.execute(
-        "SELECT * FROM edits WHERE id = %s", (EDIT["id"],)
-    ).fetchone()
+    seeded = fetch_edit_row(pg_conn, EDIT["id"])
     assert seeded["status"] == "failed", "sanity check on the seeded row"
 
     past = (datetime.now(UTC) - timedelta(seconds=5)).isoformat()
@@ -226,6 +216,6 @@ def test_retrier_success_flips_failed_row_to_classified(pg_conn):
     message, committed = run_retrier_once(client)
 
     assert committed is not None and committed == message.offset + 1
-    row = pg_conn.execute("SELECT * FROM edits WHERE id = %s", (EDIT["id"],)).fetchone()
+    row = fetch_edit_row(pg_conn, EDIT["id"])
     assert row["status"] == "classified"
     assert row["label"] == "substantive"

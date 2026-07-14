@@ -21,7 +21,7 @@ import base64
 import json
 import logging
 
-import psycopg
+import sqlalchemy.exc
 from kafka import KafkaConsumer, TopicPartition
 from kafka.structs import OffsetAndMetadata
 
@@ -168,9 +168,9 @@ def main() -> None:
             conn = db.write_with_reconnect(
                 conn, lambda c, e=edit, r=result: db.upsert_edit(c, e, r)
             )
-        except psycopg.OperationalError:
+        except sqlalchemy.exc.OperationalError:
             raise  # connection-level failure even after reconnect: abort
-        except psycopg.Error as error:
+        except sqlalchemy.exc.SQLAlchemyError as error:
             # Data-shaped failure: this record can never be persisted; skip
             # it so the DLQ stays drainable.
             logger.error(

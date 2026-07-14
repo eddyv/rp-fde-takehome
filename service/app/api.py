@@ -9,14 +9,15 @@ import binascii
 import json
 from datetime import datetime
 
-import psycopg
 from fastapi import FastAPI, HTTPException, Query
-from psycopg.rows import dict_row
+from sqlalchemy import literal, select, tuple_
 
+from app import db
 from app.classifier import VALID_LABELS, VALID_STATUSES
-from app.config import settings
+from app.models import Edit
 
 app = FastAPI(title="wiki-edits")
+
 
 def encode_cursor(processed_at: datetime, edit_id: str) -> str:
     payload = {"p": processed_at.isoformat(), "i": edit_id}
@@ -47,28 +48,25 @@ def get_edits(
             status_code=400, detail=f"status must be one of {sorted(VALID_STATUSES)}"
         )
 
-    conditions: list[str] = []
-    params: list = []
+    stmt = (
+        select(Edit)
+        .order_by(Edit.processed_at.desc(), Edit.id.desc())
+        .limit(limit + 1)  # the extra row tells us whether a next page exists
+    )
     if label is not None:
-        conditions.append("label = %s")
-        params.append(label)
+        stmt = stmt.where(Edit.label == label)
     if status is not None:
-        conditions.append("status = %s")
-        params.append(status)
+        stmt = stmt.where(Edit.status == status)
     if cursor is not None:
         cursor_processed_at, cursor_id = decode_cursor(cursor)
-        conditions.append("(processed_at, id) < (%s, %s)")
-        params.extend([cursor_processed_at, cursor_id])
+        # id breaks processed_at ties so pages never skip or repeat rows.
+        stmt = stmt.where(
+            tuple_(Edit.processed_at, Edit.id)
+            < tuple_(literal(cursor_processed_at), literal(cursor_id))
+        )
 
-    query = "SELECT * FROM edits"
-    if conditions:
-        query += " WHERE " + " AND ".join(conditions)
-    # id breaks processed_at ties so pages never skip or repeat rows.
-    query += " ORDER BY processed_at DESC, id DESC LIMIT %s"
-    params.append(limit + 1)  # the extra row tells us whether a next page exists
-
-    with psycopg.connect(settings.postgres_dsn, row_factory=dict_row) as conn:
-        rows = conn.execute(query, params).fetchall()
+    with db.get_engine().connect() as conn:
+        rows = [dict(row) for row in conn.execute(stmt).mappings()]
 
     items = rows[:limit]
     next_cursor = (
