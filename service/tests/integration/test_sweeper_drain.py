@@ -15,20 +15,19 @@ the broker/DB invariants that in-process doubles cannot prove:
 - the sweeper group's committed offset lands exactly on the snapshot boundary,
   leaving the requeued tail uncommitted for the next sweep.
 
-Fault injection reuses tests.fakes: `main()` builds its own anthropic client,
-so we monkeypatch the constructor to return a FakeClient scripted in DLQ
-offset order (one partition => consumption order is production order). Note
-the blast radius: sweeper.py does `import anthropic`, so patching
-`sweeper.anthropic.Anthropic` patches the shared `anthropic` module for every
-importer until monkeypatch teardown -- fine while tests run serially and
-nothing else builds a client mid-test, but not sweeper-scoped.
+Fault injection reuses tests.fakes: `main()` builds its own anthropic client
+via `infra.make_classifier_client()`, so we monkeypatch `infra.Anthropic` (the
+module-local factory seam) to return a FakeClient scripted in DLQ offset
+order (one partition => consumption order is production order). This is
+module-scoped to `app.infra`, not the shared `anthropic` package, so it no
+longer risks blast radius onto every other importer of `anthropic`.
 """
 
 import json
 import sys
 
 import pytest
-from app import classifier, failures, sweeper
+from app import classifier, failures, infra, sweeper
 from app.config import settings
 
 from tests.fakes import FakeClient, make_message, make_status_error
@@ -99,9 +98,9 @@ def test_sweeper_reclassifies_requeues_skips_and_stops_at_boundary(pg_conn, monk
     boundary = end_offset(settings.kafka_dlq_topic)
     assert boundary == 4, "sanity: four seeded DLQ records before the sweep"
 
-    # main() constructs its own anthropic.Anthropic; hand it a FakeClient with
-    # outputs scripted in DLQ offset order for the two records that reach
-    # classify():
+    # main() constructs its own client via infra.make_classifier_client();
+    # hand it a FakeClient with outputs scripted in DLQ offset order for the
+    # two records that reach classify():
     #   - reclassifiable -> GOOD_JSON (one call; confidence 0.8 >= threshold so
     #     the second-pass prompt never fires);
     #   - still-failing  -> three 500s, exhausting the classifier's bounded
@@ -117,7 +116,7 @@ def test_sweeper_reclassifies_requeues_skips_and_stops_at_boundary(pg_conn, monk
             make_status_error(500),
         ]
     )
-    monkeypatch.setattr(sweeper.anthropic, "Anthropic", lambda **kwargs: fake)
+    monkeypatch.setattr(infra, "Anthropic", lambda **kwargs: fake)
     monkeypatch.setattr(sys, "argv", ["sweeper"])
 
     # Prove the --model/sweeper_model plumbing is real, not a no-op: set a

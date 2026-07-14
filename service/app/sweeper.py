@@ -21,12 +21,11 @@ import base64
 import json
 import logging
 
-import anthropic
 import psycopg
 from kafka import KafkaConsumer, TopicPartition
 from kafka.structs import OffsetAndMetadata
 
-from app import db, failures
+from app import db, failures, infra
 from app.classifier import (
     ClassificationParseError,
     ModelConfigError,
@@ -64,14 +63,8 @@ def main() -> None:
     args = parser.parse_args()
     model = args.model or settings.sweeper_model or settings.anthropic_model
 
-    # SDK retries disabled (classifier.py owns them); the explicit request
-    # timeout keeps a hung call from stalling the drain for 10 minutes.
-    client = anthropic.Anthropic(
-        api_key=settings.anthropic_api_key.get_secret_value(),
-        base_url=settings.anthropic_base_url,
-        max_retries=0,
-        timeout=60.0,
-    )
+    # See infra.make_classifier_client for the guardrail rationale.
+    client = infra.make_classifier_client()
     conn = db.connect()
     consumer = make_consumer()
     producer = failures.make_producer()

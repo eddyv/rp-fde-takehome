@@ -22,14 +22,11 @@ Per-class routing (see classifier.py for the taxonomy):
 
 import json
 import logging
-import time
 
-import anthropic
 import psycopg
 from kafka import KafkaConsumer
-from kafka.errors import KafkaError
 
-from app import db, failures
+from app import db, failures, infra
 from app.classifier import (
     ClassificationParseError,
     ModelConfigError,
@@ -43,28 +40,14 @@ logger = logging.getLogger(__name__)
 
 # Model calls are bounded (see main: request timeout 60s; classify makes at
 # most 6 calls (3 bounded attempts × first + optional second pass) plus
-# seconds of backoff), so per-message time stays under this.
+# seconds of backoff), so per-message time stays under infra.MAX_POLL_INTERVAL_MS.
 # The kafka-python default (300s) is too tight for a slow multi-pass classify.
-MAX_POLL_INTERVAL_MS = 600_000
 
 
 def make_consumer(retries: int = 30, delay: float = 2.0) -> KafkaConsumer:
-    for attempt in range(retries):
-        try:
-            return KafkaConsumer(
-                settings.kafka_topic,
-                bootstrap_servers=settings.kafka_brokers.split(","),
-                group_id=settings.consumer_group,
-                enable_auto_commit=False,
-                auto_offset_reset="earliest",
-                max_poll_interval_ms=MAX_POLL_INTERVAL_MS,
-            )
-        except KafkaError as error:  # broker not up yet at stack boot
-            if attempt == retries - 1:
-                raise
-            logger.info("kafka not ready (%s), retrying...", type(error).__name__)
-            time.sleep(delay)
-    raise RuntimeError("unreachable")
+    return infra.make_consumer(
+        settings.kafka_topic, settings.consumer_group, retries=retries, delay=delay
+    )
 
 
 def handle_message(client, conn, consumer, producer, breaker, message):
@@ -184,15 +167,8 @@ def _handle_edit(client, conn, consumer, producer, breaker, message, edit):
 
 
 def main() -> None:
-    # SDK retries are disabled: this service owns retry/backoff (classifier.py).
-    # The explicit request timeout (SDK default is 600s) keeps one hung call
-    # from blowing past max_poll_interval_ms and evicting us from the group.
-    client = anthropic.Anthropic(
-        api_key=settings.anthropic_api_key.get_secret_value(),
-        base_url=settings.anthropic_base_url,
-        max_retries=0,
-        timeout=60.0,
-    )
+    # See infra.make_classifier_client for the guardrail rationale.
+    client = infra.make_classifier_client()
     conn = db.connect()
     consumer = make_consumer()
     producer = failures.make_producer()

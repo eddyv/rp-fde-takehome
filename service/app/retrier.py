@@ -5,10 +5,10 @@ Delay model: each envelope carries `not_before`; the retrier sleeps until it
 `not_before` is processed immediately). Per-message time is bounded:
 `not_before` delays cap at settings.retry_backoff_max_seconds (120s) and every
 model call is bounded by the client's 60s request timeout, both well inside
-max_poll_interval_ms (600s); kafka-python heartbeats from a background thread,
-so sleeping in the poll loop is safe. If delays ever needed to approach the
-poll interval, the right tool would be consumer.pause() + periodic poll()
-instead of sleeping.
+infra.MAX_POLL_INTERVAL_MS (600s); kafka-python heartbeats from a background
+thread, so sleeping in the poll loop is safe. If delays ever needed to
+approach the poll interval, the right tool would be consumer.pause() +
+periodic poll() instead of sleeping.
 
 Outcomes per envelope (same commit-after-publish invariant as the worker):
 - success -> classified row (flips the failed row), commit, breaker resets.
@@ -27,12 +27,10 @@ import logging
 import time
 from datetime import UTC, datetime
 
-import anthropic
 import psycopg
 from kafka import KafkaConsumer
-from kafka.errors import KafkaError
 
-from app import db, failures
+from app import db, failures, infra
 from app.classifier import (
     ClassificationParseError,
     ModelConfigError,
@@ -44,27 +42,16 @@ from app.config import settings
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-MAX_POLL_INTERVAL_MS = 600_000
 SLEEP_CHUNK_SECONDS = 5
 
 
 def make_consumer(retries: int = 30, delay: float = 2.0) -> KafkaConsumer:
-    for attempt in range(retries):
-        try:
-            return KafkaConsumer(
-                settings.kafka_retry_topic,
-                bootstrap_servers=settings.kafka_brokers.split(","),
-                group_id=settings.retrier_consumer_group,
-                enable_auto_commit=False,
-                auto_offset_reset="earliest",
-                max_poll_interval_ms=MAX_POLL_INTERVAL_MS,
-            )
-        except KafkaError as error:  # broker not up yet at stack boot
-            if attempt == retries - 1:
-                raise
-            logger.info("kafka not ready (%s), retrying...", type(error).__name__)
-            time.sleep(delay)
-    raise RuntimeError("unreachable")
+    return infra.make_consumer(
+        settings.kafka_retry_topic,
+        settings.retrier_consumer_group,
+        retries=retries,
+        delay=delay,
+    )
 
 
 def _now() -> datetime:
@@ -237,15 +224,8 @@ def _handle_edit(
 
 
 def main() -> None:
-    # SDK retries are disabled: this service owns retry/backoff (classifier.py).
-    # The explicit request timeout (SDK default is 600s) keeps one hung call
-    # from blowing past max_poll_interval_ms and evicting us from the group.
-    client = anthropic.Anthropic(
-        api_key=settings.anthropic_api_key.get_secret_value(),
-        base_url=settings.anthropic_base_url,
-        max_retries=0,
-        timeout=60.0,
-    )
+    # See infra.make_classifier_client for the guardrail rationale.
+    client = infra.make_classifier_client()
     conn = db.connect()
     consumer = make_consumer()
     producer = failures.make_producer()

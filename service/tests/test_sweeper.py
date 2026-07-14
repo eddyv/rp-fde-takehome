@@ -9,7 +9,7 @@ import json
 
 import psycopg
 import pytest
-from app import db, failures, sweeper
+from app import db, failures, infra, sweeper
 from app.config import settings
 from kafka import TopicPartition
 from kafka.structs import OffsetAndMetadata
@@ -88,7 +88,7 @@ def run_sweeper(monkeypatch, consumer, client, conn=None, argv=(), client_kwargs
         return client
 
     monkeypatch.setattr("sys.argv", ["sweeper", *argv])
-    monkeypatch.setattr(sweeper.anthropic, "Anthropic", fake_anthropic)
+    monkeypatch.setattr(infra, "Anthropic", fake_anthropic)
     monkeypatch.setattr(db, "connect", lambda: conn if conn is not None else FakeConn())
     monkeypatch.setattr(sweeper, "make_consumer", lambda: consumer)
     producer = FakeProducer()
