@@ -30,7 +30,7 @@ from datetime import UTC, datetime
 import psycopg
 from kafka import KafkaConsumer
 
-from app import db, failures, infra
+from app import db, failures, infra, routing
 from app.classifier import (
     ClassificationParseError,
     ModelConfigError,
@@ -143,72 +143,32 @@ def _handle_edit(
         )
         raise SystemExit(1) from error
     except ModelUnavailableError as error:
-        error_text = str(error)  # `error` is unbound once the except block exits
-        attempts += 1
-        conn = db.write_with_reconnect(
-            conn,
-            lambda c: db.upsert_failed_edit(
-                c, edit, failures.REASON_TRANSIENT_EXHAUSTED, error_text
-            ),
-        )
-        # attempts counts the worker's first pass plus each retrier pass.
-        if attempts >= 1 + settings.max_retry_passes:
-            logger.warning(
-                "edit %s exhausted %d attempts -> DLQ", edit.get("id"), attempts
-            )
-            out = failures.make_envelope(
-                reason=failures.REASON_RETRIES_EXHAUSTED,
-                error=error_text,
-                source="retrier",
-                message=message,
-                edit=edit,
-                attempts=attempts,
-                first_failed_at=first_failed_at,
-            )
-            failures.publish(producer, settings.kafka_dlq_topic, out)
-        else:
-            out = failures.make_envelope(
-                reason=failures.REASON_TRANSIENT_EXHAUSTED,
-                error=error_text,
-                source="retrier",
-                message=message,
-                edit=edit,
-                attempts=attempts,
-                first_failed_at=first_failed_at,
-                not_before=failures.next_not_before(attempts),
-            )
-            failures.publish(producer, settings.kafka_retry_topic, out)
-        consumer.commit()
-        if breaker.record_failure():
-            logger.critical(
-                "circuit breaker tripped after %d consecutive transient failures; "
-                "crashing so restart backoff becomes the half-open probe",
-                breaker.threshold,
-            )
-            raise SystemExit(1)
-        return conn
-    except ClassificationParseError as error:
-        error_text = str(error)
-        logger.warning("unusable model output for edit %s -> DLQ", edit.get("id"))
-        conn = db.write_with_reconnect(
-            conn,
-            lambda c: db.upsert_failed_edit(
-                c, edit, failures.REASON_PARSE_FAILED, error_text
-            ),
-        )
-        out = failures.make_envelope(
-            reason=failures.REASON_PARSE_FAILED,
-            error=error_text,
-            source="retrier",
+        attempts += 1  # counts the worker's first pass plus each retrier pass
+        return routing.handle_classifier_failure(
+            error,
+            conn=conn,
+            consumer=consumer,
+            producer=producer,
+            breaker=breaker,
             message=message,
             edit=edit,
+            source="retrier",
             attempts=attempts,
             first_failed_at=first_failed_at,
         )
-        failures.publish(producer, settings.kafka_dlq_topic, out)
-        consumer.commit()
-        breaker.record_success()  # the API is reachable; only the output was bad
-        return conn
+    except ClassificationParseError as error:
+        return routing.handle_classifier_failure(
+            error,
+            conn=conn,
+            consumer=consumer,
+            producer=producer,
+            breaker=breaker,
+            message=message,
+            edit=edit,
+            source="retrier",
+            attempts=attempts,
+            first_failed_at=first_failed_at,
+        )
 
     conn = db.write_with_reconnect(conn, lambda c: db.upsert_edit(c, edit, result))
     consumer.commit()

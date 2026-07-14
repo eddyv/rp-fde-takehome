@@ -26,7 +26,7 @@ import logging
 import psycopg
 from kafka import KafkaConsumer
 
-from app import db, failures, infra
+from app import db, failures, infra, routing
 from app.classifier import (
     ClassificationParseError,
     ModelConfigError,
@@ -102,56 +102,18 @@ def _handle_edit(client, conn, consumer, producer, breaker, message, edit):
             "deterministic model failure (bad key/config?), crashing: %s", error
         )
         raise SystemExit(1) from error
-    except ModelUnavailableError as error:
-        error_text = str(error)  # `error` is unbound once the except block exits
-        logger.warning(
-            "transient failure exhausted for edit %s: %s", edit.get("id"), error_text
-        )
-        conn = db.write_with_reconnect(
-            conn,
-            lambda c: db.upsert_failed_edit(
-                c, edit, failures.REASON_TRANSIENT_EXHAUSTED, error_text
-            ),
-        )
-        envelope = failures.make_envelope(
-            reason=failures.REASON_TRANSIENT_EXHAUSTED,
-            error=error_text,
-            source="worker",
+    except (ModelUnavailableError, ClassificationParseError) as error:
+        return routing.handle_classifier_failure(
+            error,
+            conn=conn,
+            consumer=consumer,
+            producer=producer,
+            breaker=breaker,
             message=message,
             edit=edit,
+            source="worker",
             attempts=1,
-            not_before=failures.next_not_before(1),
         )
-        failures.publish(producer, settings.kafka_retry_topic, envelope)
-        consumer.commit()
-        if breaker.record_failure():
-            logger.critical(
-                "circuit breaker tripped after %d consecutive transient failures; "
-                "crashing so restart backoff becomes the half-open probe",
-                breaker.threshold,
-            )
-            raise SystemExit(1)
-        return conn
-    except ClassificationParseError as error:
-        error_text = str(error)
-        logger.warning("unusable model output for edit %s -> DLQ", edit.get("id"))
-        conn = db.write_with_reconnect(
-            conn,
-            lambda c: db.upsert_failed_edit(
-                c, edit, failures.REASON_PARSE_FAILED, error_text
-            ),
-        )
-        envelope = failures.make_envelope(
-            reason=failures.REASON_PARSE_FAILED,
-            error=error_text,
-            source="worker",
-            message=message,
-            edit=edit,
-        )
-        failures.publish(producer, settings.kafka_dlq_topic, envelope)
-        consumer.commit()
-        breaker.record_success()  # the API is reachable; only the output was bad
-        return conn
 
     conn = db.write_with_reconnect(conn, lambda c: db.upsert_edit(c, edit, result))
     consumer.commit()
