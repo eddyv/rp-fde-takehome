@@ -26,6 +26,13 @@ class Settings(BaseSettings):
     # Below this confidence, a second-pass prompt with more context is attempted.
     confidence_threshold: float = 0.6
 
+    # Bounded retry for one classifier call attempt (transient errors only —
+    # see classifier.call_model): exponential delay
+    # classifier_backoff_base_seconds * 2**attempt between attempts, none
+    # after the last.
+    classifier_max_call_attempts: int = 3
+    classifier_backoff_base_seconds: float = 1.0
+
     # Crash after this many consecutive transient-exhausted outcomes; Docker's
     # restart backoff then acts as the half-open probe.
     breaker_threshold: int = 25

@@ -27,7 +27,7 @@ import json
 import sys
 
 import pytest
-from app import classifier, failures, infra, sweeper
+from app import failures, infra, sweeper
 from app.config import settings
 
 from tests.fakes import FakeClient, make_message, make_status_error
@@ -134,7 +134,7 @@ def test_sweeper_reclassifies_requeues_skips_and_stops_at_boundary(
     # call time) and the classifier's inter-retry backoff between the three
     # scripted 500s dominate this test's wall clock otherwise.
     monkeypatch.setattr(sweeper, "CONSUMER_TIMEOUT_MS", 2000)
-    monkeypatch.setattr(classifier, "BACKOFF_SECONDS", [0, 0, 0])
+    monkeypatch.setattr(settings, "classifier_backoff_base_seconds", 0)
 
     sweeper.main()
 

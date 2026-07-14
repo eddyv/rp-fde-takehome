@@ -8,6 +8,13 @@ from sqlalchemy import REAL, Integer, Text, func
 from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+# The label/status columns' allowed values. `status` is enforced by a CHECK
+# constraint in sql/schema.sql; `label` has no DB-level constraint (only a
+# descriptive comment there) but this is the set the classifier is allowed
+# to assign, so callers validate against it here instead.
+VALID_LABELS = {"vandalism", "substantive", "trivia", "unclear"}
+VALID_STATUSES = {"classified", "failed"}
+
 
 class Base(DeclarativeBase):
     pass

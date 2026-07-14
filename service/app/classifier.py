@@ -25,12 +25,9 @@ from dataclasses import dataclass
 import anthropic
 
 from app.config import settings
+from app.models import VALID_LABELS
 
 logger = logging.getLogger(__name__)
-
-VALID_LABELS = {"vandalism", "substantive", "trivia", "unclear"}
-
-VALID_STATUSES = {"classified", "failed"}
 
 # sorted() for deterministic serialization — helps prompt caching and
 # reproducibility. Numeric range constraints are not supported by structured
@@ -45,9 +42,6 @@ OUTPUT_SCHEMA: dict[str, object] = {
     "required": ["label", "confidence", "reasoning"],
     "additionalProperties": False,
 }
-
-MAX_CALL_ATTEMPTS = 3
-BACKOFF_SECONDS = [1, 2, 4]
 
 
 @dataclass
@@ -125,7 +119,8 @@ def call_model(client: anthropic.Anthropic, prompt: str, model: str):
     ModelUnavailableError once the transient retry budget is exhausted.
     """
     last_error = None
-    for attempt in range(MAX_CALL_ATTEMPTS):
+    max_attempts = settings.classifier_max_call_attempts
+    for attempt in range(max_attempts):
         try:
             return client.messages.create(
                 model=model,
@@ -157,8 +152,8 @@ def call_model(client: anthropic.Anthropic, prompt: str, model: str):
             # treat them as transient so exhaustion lands in
             # ModelUnavailableError instead of crash-looping the worker.
             last_error = error
-        if attempt < MAX_CALL_ATTEMPTS - 1:
-            time.sleep(BACKOFF_SECONDS[attempt])
+        if attempt < max_attempts - 1:
+            time.sleep(settings.classifier_backoff_base_seconds * 2**attempt)
     raise ModelUnavailableError(str(last_error)) from last_error
 
 

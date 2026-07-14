@@ -25,8 +25,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app import db
-from app.classifier import VALID_LABELS, VALID_STATUSES
-from app.models import Edit
+from app.models import VALID_LABELS, VALID_STATUSES, Edit
 
 app = FastAPI(title="wiki-edits")
 
