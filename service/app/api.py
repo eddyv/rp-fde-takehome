@@ -1,5 +1,5 @@
-"""Thin serve layer: GET /edits?label=&status=&size=&cursor= reads edits from
-Postgres.
+"""Thin serve layer: GET /edits?label=&status=&size=&cursor= and GET /stats
+read edits from Postgres.
 
 Results are cursor-paginated by fastapi-pagination (sqlakeyset) using a
 keyset on (processed_at DESC, id DESC); the response is a CursorPage:
@@ -21,7 +21,7 @@ from fastapi_pagination.customization import (
 from fastapi_pagination.ext.sqlalchemy import paginate
 from pydantic import BaseModel, ConfigDict
 from sqlakeyset import InvalidPage
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app import db
@@ -84,6 +84,34 @@ def get_edits(
         return paginate(session, query)
     except InvalidPage:
         raise HTTPException(status_code=400, detail="invalid cursor") from None
+
+
+STATS_STMT = select(Edit.label, Edit.status, func.count()).group_by(
+    Edit.label, Edit.status
+)
+
+
+def summarize_stats(rows) -> dict:
+    """Fold (label|None, status, count) rows into the /stats response.
+
+    label is NULL on failed rows, so NULL labels count toward total and
+    by_status but never appear in by_label. Zero-count keys are absent,
+    not zero-filled.
+    """
+    total = 0
+    by_label: dict[str, int] = {}
+    by_status: dict[str, int] = {}
+    for label, status, count in rows:
+        total += count
+        if label is not None:
+            by_label[label] = by_label.get(label, 0) + count
+        by_status[status] = by_status.get(status, 0) + count
+    return {"total": total, "by_label": by_label, "by_status": by_status}
+
+
+@app.get("/stats")
+def get_stats(session: Session = Depends(get_session)) -> dict:
+    return summarize_stats(session.execute(STATS_STMT).all())
 
 
 add_pagination(app)

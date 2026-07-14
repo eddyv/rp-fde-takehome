@@ -56,6 +56,9 @@ curl "http://localhost:8000/edits?status=failed&size=5"
 #  "previous_page": ..., "next_page": "eyJwIjoi..."}
 # pass next_page back as ?cursor= (with the same filters) until it is null
 curl "http://localhost:8000/edits?size=5&cursor=eyJwIjoi..."
+
+curl "http://localhost:8000/stats"
+# {"total": ..., "by_label": {...}, "by_status": {...}} — label/status counts
 ```
 ## Design Notes
 - Pagination is provided by fastapi-pagination (backed by sqlakeyset) over a

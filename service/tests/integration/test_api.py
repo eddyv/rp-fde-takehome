@@ -178,3 +178,27 @@ def test_exact_size_last_page(pg_conn):
 
     assert [row["id"] for row in body["items"]] == ["e3", "e2", "e1"]
     assert body["next_page"] is None
+
+
+def test_stats_counts_labels_and_statuses(pg_conn):
+    seed_edit(pg_conn, "s1", BASE_TIME, label="trivia", status="classified")
+    seed_edit(pg_conn, "s2", BASE_TIME, label="vandalism", status="classified")
+    seed_edit(pg_conn, "s3", BASE_TIME, label=None, status="failed")
+
+    client = TestClient(api.app)
+    body = client.get("/stats").json()
+
+    assert body == {
+        "total": 3,
+        "by_label": {"trivia": 1, "vandalism": 1},
+        "by_status": {"classified": 2, "failed": 1},
+    }
+
+
+def test_stats_empty_table(pg_conn):
+    client = TestClient(api.app)
+    assert client.get("/stats").json() == {
+        "total": 0,
+        "by_label": {},
+        "by_status": {},
+    }
