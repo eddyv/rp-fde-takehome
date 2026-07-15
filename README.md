@@ -31,6 +31,7 @@ the tradeoffs, and what broke.
 ## Run it
 
 ```sh
+# If using hosted, get your key from https://platform.claude.com/settings/workspaces/default/keys
 cp .env.example .env       # put your ANTHROPIC_API_KEY in .env
 docker compose up --build -d
 ```
@@ -50,6 +51,13 @@ Watch it classify:
 
 ```sh
 docker compose logs -f worker
+```
+
+To teardown:
+
+```sh
+docker compose down
+# docker system prune -f && docker volume prune -f # run this if you want to cleanup your volumes and clean up unused Docker resources. This operation is destructive.
 ```
 
 ### Query results
