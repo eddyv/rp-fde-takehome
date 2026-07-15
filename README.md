@@ -116,49 +116,21 @@ Currently, topics are configured to be single partitioned and the latency for pr
 
 Beyond the data itself, I'd weigh required freshness. **[Message Batch APIs](https://platform.claude.com/docs/en/build-with-claude/batch-processing)** cut cost at the expense of latency. Not suitable at this exercise's volume, but worth considering in production.
 
-### Surprises hit while building
+### Surprises Encountered During the Build
 
-- The SSE stream interleaves non-JSON heartbeat/comment lines with `data:`
-  frames. Bloblang does not fail closed inside `if`, so `parse_json()` needs
-  `.catch(deleted())` or a raw heartbeat string sails through and breaks the
-  topic schema.
-- Wikimedia 403s clients with no `User-Agent`; the pipeline sets one.
-- Wikipedia's `rc_id` is a large number; Bloblang's `.string()` on a parsed
-  JSON number renders float64 scientific notation (`"2.04e+09"`). Cast
-  `.int64()` first.
-- Redpanda Connect's `redpanda` output compresses with **snappy by default**,
-  and `kafka-python` cannot decode snappy without an extra C library. The
-  output sets `compression: none` (the filtered stream is low-volume).
-- Wikipedia timestamps are epoch **seconds**; Postgres `TIMESTAMPTZ` rejects
-  raw epochs, so the pipeline formats to ISO with `ts_format`.
+The build proceeded smoothly overall. Feeding `HINTS.md` to the LLM sped up development and avoided common pitfalls. The main gotcha involved discrepancies between hosted and local model providers: Anthropic supports [Structured Outputs](https://platform.claude.com/docs/en/build-with-claude/structured-outputs), requiring [Ollama v0.14+](https://github.com/ollama/ollama/releases?page=7#release-v0.14.0) for local parity. Additionally, since Postgres 16 lacks native UUIDv7 support, cursor-based pagination required a composite `(processed_at, id)` key instead of a single time-ordered column.
+
+Other issues worth noting:
+- Wikipedia's `rc_id` is large enough that Bloblang's `.string()` renders it in scientific notation (`"2.04e+09"`); casting to `.int64()` first avoids this.
+- Redpanda Connect's `redpanda` output defaults to snappy compression, which `kafka-python` can't decode without an extra C library — resolved by setting `compression: none` given the low-volume filtered stream.
 
 ### Where would this break in production?
 
-- **Missing Parallization**: Wiki recentchanges as a source (once filtered) is 
-  relatively low throughput so a single partition + a hosted LLM can perform *fine*. 
-  However, realistically you'd want to parallelize your proccesses so determining a good 
-  partition count would help.
-- **Missing/invalid API key**: the worker deliberately crash-loops instead of
-  draining the topic into fake data — a deterministic failure, so offsets
-  stay uncommitted and every message is redelivered once the key's fixed.
-  Full taxonomy and the operator runbook: [`DESIGN.md`](DESIGN.md).
-- **Wikimedia disconnects long-lived SSE clients** (~15 min). Connect's
-  `http_client` input reconnects, but there is no `Last-Event-ID` resume here,
-  so a reconnect can drop or duplicate a few events. The UPSERT absorbs
-  duplicates; drops are acceptable for this use case.
-- **Anthropic rate limits / outages**: the worker retries transient errors
-  (429, 5xx, 408/409, network) 3× with backoff, then marks the row
-  `status='failed'` and parks the message on `wiki.edits.retry` for delayed,
-  bounded re-attempts — provenance is never overloaded onto the `unclear`
-  label, and poison messages can't wedge the consumer. A sustained outage
-  trips a circuit breaker (25 consecutive failures) that crash-loops the
-  worker; Docker's restart backoff acts as the half-open probe.
-- **Postgres restarts**: the worker reconnects and retries the write once;
-  offsets aren't committed until the write succeeds, so nothing is lost.
-- **Worker restarts / redelivery**: at-least-once delivery + UPSERT on `id`
-  keeps the table consistent (last write wins, except that a redelivered
-  stale failure can never overwrite an already-classified row).
-- **Cost control**: filtering happens before the topic (~50 events/sec down
-  to a few/sec — enwiki, namespace 0, `type=edit`, `bot=false`), `max_tokens=256`,
-  and the second-pass prompt fires only below the confidence threshold. If
-  enwiki spikes, consumer lag grows rather than spend exploding per-event.
+- **Missing parallelization**: Filtered Wikipedia recentchanges traffic is low enough that a single partition and hosted LLM perform fine here, but a real deployment would need parallelized processing & tuning partition count and topic config (`retention.ms`, etc.) accordingly.
+- **Missing / Invalid API key**: The worker deliberately crash-loops rather than draining the topic into fake data. This is a deterministic failure, so offsets stay uncommitted and every message is redelivered once the key is fixed. Full taxonomy and the operator runbook: [`DESIGN.md`](DESIGN.md).
+- **Wikimedia disconnects long-lived SSE clients** (~15 min). Connect's `http_client` input reconnects but doesn't support `Last-Event-ID` resume, so reconnects can drop or duplicate events. The UPSERT absorbs duplicates; drops are acceptable for this use case.
+- **Anthropic rate limits / outages**: Transient errors (429, 5xx, 408/409, network) are retried 3× with backoff, then the row is marked `status='failed'` and parked on `wiki.edits.retry` for delayed, bounded re-attempts — provenance is never overloaded onto the `unclear` label, and poison messages can't wedge the consumer. A sustained outage trips a circuit breaker (25 consecutive failures) that crash-loops the worker, with Docker's restart backoff acting as the half-open probe.
+- **Circuit breakers**: The current breaker is a hand-rolled implementation relying on Docker for recovery. Production would need a proper library like [pybreaker](https://pypi.org/project/pybreaker/) with real half-open/self-healing support.
+- **Cost control**: Filtering happens before the topic (~50 events/sec down to a few/sec via enwiki, namespace 0, `type=edit`, `bot=false`), `max_tokens=256` caps responses, and the second-pass prompt only fires below the confidence threshold. If enwiki spikes, consumer lag grows instead of spend scaling per-event.
+- **LLM prompt injection**: No explicit protection exists beyond a rudimentary guard wrapping text in `<<>>` — no dangerous-pattern detection or human-in-the-loop controls. A production system would apply techniques from the [OWASP LLM Prompt Injection Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/LLM_Prompt_Injection_Prevention_Cheat_Sheet.html#primary-defenses). Acceptable for this exercise's scope, but worth flagging.
+- **Observability / Metrics**: The stack lacks proper observability (Prometheus + Grafana would suffice) to track application health (consumer lag [regular & dead-letter-topics], transient errors, crash loops, etc. are all invisible). The only insight available is a `/stats` endpoint showing event counts and their labels/status.
