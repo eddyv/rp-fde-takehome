@@ -5,8 +5,12 @@ Run with the API up (see README):
     uv run --directory service python -m app.tui
     EDITS_API_URL=http://localhost:8000 uv run --directory service python -m app.tui
 
-Keys: n next page, p previous page, r reset to first page, q quit.
+Keys: n next page, p previous page, r reset to first page, R refresh current
+page in place, q quit.
 Tab into the label/status selects to filter; changing either resets to page 1.
+The app polls GET /stats every EDITS_TUI_POLL_SECONDS (default 5, <=0 turns it
+off): on the first page new edits appear automatically; while paging deeper a
+"new edits" note shows in the status line instead, so the view never jumps.
 The data table keeps focus by default — use arrow keys to scroll to columns
 that don't fit on screen (the free-text columns are last). Press enter on a
 row for the full record on its own screen.
@@ -15,6 +19,7 @@ row for the full record on its own screen.
 import os
 
 import httpx
+from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, VerticalScroll
 from textual.screen import ModalScreen
@@ -23,6 +28,7 @@ from textual.widgets import DataTable, Footer, Header, Select, Static
 from app.models import VALID_LABELS, VALID_STATUSES
 
 API_URL = os.environ.get("EDITS_API_URL", "http://localhost:8000")
+POLL_SECONDS = float(os.environ.get("EDITS_TUI_POLL_SECONDS", "5"))
 
 TIMESTAMP_COLUMNS = ("event_time", "processed_at")
 
@@ -96,19 +102,23 @@ class EditsBrowser(App):
         ("n", "next_page", "Next page"),
         ("p", "prev_page", "Previous page"),
         ("r", "reset", "First page"),
+        ("R", "refresh", "Refresh"),
         ("q", "quit", "Quit"),
     ]
 
     def __init__(self, base_url: str = API_URL) -> None:
         super().__init__()
         self.base_url = base_url
-        self.client = httpx.Client(base_url=base_url, timeout=10.0)
+        self.client = httpx.AsyncClient(base_url=base_url, timeout=10.0)
         self.cursor: str | None = None
         self.next_page: str | None = None
         self.previous_page: str | None = None
         self.label: str | None = None
         self.status: str | None = None
         self.items_by_id: dict[str, dict] = {}
+        self.row_count: int = 0
+        self.new_edits_available: bool = False
+        self._last_stats: dict | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -133,6 +143,8 @@ class EditsBrowser(App):
         table.cursor_type = "row"
         table.focus()
         self.load_page()
+        if POLL_SECONDS > 0:
+            self.set_interval(POLL_SECONDS, self.poll_stats)
 
     def on_select_changed(self, event: Select.Changed) -> None:
         value = None if event.select.is_blank() else str(event.value)
@@ -143,7 +155,8 @@ class EditsBrowser(App):
         self.cursor = None
         self.load_page()
 
-    def load_page(self) -> None:
+    @work(exclusive=True, group="page")
+    async def load_page(self) -> None:
         params = {"size": 50}
         if self.cursor:
             params["cursor"] = self.cursor
@@ -154,7 +167,9 @@ class EditsBrowser(App):
 
         status_line = self.query_one("#status_line", Static)
         try:
-            response = self.client.get("/edits", params=params)
+            # The single await before any mutation: a cancelled (superseded)
+            # worker leaves all state untouched.
+            response = await self.client.get("/edits", params=params)
             response.raise_for_status()
         except httpx.HTTPError as exc:
             status_line.update(f"[red]request failed: {exc}[/red]")
@@ -165,6 +180,13 @@ class EditsBrowser(App):
         self.previous_page = page.get("previous_page")
 
         table = self.query_one(DataTable)
+        selected_id = None
+        if table.row_count > 0:
+            try:
+                cell_key = table.coordinate_to_cell_key(table.cursor_coordinate)
+                selected_id = cell_key.row_key.value
+            except Exception:
+                selected_id = None
         table.clear()
         self.items_by_id.clear()
         for item in page["items"]:
@@ -173,12 +195,51 @@ class EditsBrowser(App):
                 *(_format_cell(col, item.get(col)) for col in COLUMNS),
                 key=item["id"],
             )
+        # Keep the highlight on the same edit if it's still on the page; new
+        # rows sorting in above it must not silently move the selection.
+        if selected_id is not None and selected_id in self.items_by_id:
+            row = list(self.items_by_id).index(selected_id)
+            table.move_cursor(row=row)
 
+        self.row_count = len(page["items"])
+        self.new_edits_available = False
+        self._update_status_line()
+
+    def _update_status_line(self) -> None:
         filters = f"label={self.label or 'any'} status={self.status or 'any'}"
         prev_flag = "yes" if self.previous_page else "no"
         next_flag = "yes" if self.next_page else "no"
         nav = f"prev={prev_flag} next={next_flag}"
-        status_line.update(f"{filters}  |  {len(page['items'])} rows  |  {nav}")
+        text = f"{filters}  |  {self.row_count} rows  |  {nav}"
+        if self.new_edits_available:
+            text += "  |  [yellow]new edits — R to refresh[/yellow]"
+        self.query_one("#status_line", Static).update(text)
+
+    @work(exclusive=True, group="stats")
+    async def poll_stats(self) -> None:
+        # /stats is unfiltered, so with a label/status filter active this can
+        # fire for edits outside the filtered view; a page-1 reload then just
+        # repaints the same rows, which is harmless. Upserts that change
+        # neither the total nor the label/status counts stay undetected.
+        try:
+            response = await self.client.get("/stats")
+            response.raise_for_status()
+            stats = response.json()
+        except httpx.HTTPError:
+            return  # background poll: fail silently, never touch the UI
+        if self._last_stats is None:
+            self._last_stats = stats  # first poll is just the baseline
+            return
+        if stats == self._last_stats:
+            return
+        self._last_stats = stats
+        modal_open = len(self.screen_stack) > 1
+        if self.cursor is None and not modal_open:
+            # First page is where new edits sort to; reload it in place.
+            self.load_page()
+        else:
+            self.new_edits_available = True
+            self._update_status_line()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         item = self.items_by_id.get(str(event.row_key.value))
@@ -199,8 +260,12 @@ class EditsBrowser(App):
         self.cursor = None
         self.load_page()
 
-    def on_unmount(self) -> None:
-        self.client.close()
+    def action_refresh(self) -> None:
+        # Unlike action_reset this keeps the cursor: same page, fresh data.
+        self.load_page()
+
+    async def on_unmount(self) -> None:
+        await self.client.aclose()
 
 
 def main() -> None:
