@@ -88,7 +88,7 @@ Consistency notes:
   the new env) or the circuit breaker tripped during an outage — the restart
   loop probes automatically and consumption resumes when the API recovers.
   Offsets are never committed on these paths, so no data is lost either way.
-- **Inspect redpanda **:
+- **Inspect redpanda**:
   ```sh
   # consume from a topic
   docker run --rm -it --network redpanda-fde-takehome_default docker.redpanda.com/redpandadata/redpanda:v25.3.15 topic consume wiki.edits.raw -X brokers=redpanda:9092
