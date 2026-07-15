@@ -85,9 +85,9 @@ curl "http://localhost:8000/stats"
 uv run --directory service edits-tui
 ```
 
-Keys: `n`/`p` page, `r` first page, `R` refresh current page in place, `q` quit.
+Keys: `n`/`p` page, `r` first page, `f` refresh current page in place, `q` quit.
 The TUI polls `/stats` for changes: on the first page new edits appear
-automatically; while paging deeper it shows a "new edits — R to refresh" note
+automatically; while paging deeper it shows a "new edits — f to refresh" note
 instead of yanking the view.
 
 ## Development

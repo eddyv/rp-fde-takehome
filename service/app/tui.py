@@ -5,7 +5,7 @@ Run with the API up (see README):
     uv run --directory service python -m app.tui
     EDITS_API_URL=http://localhost:8000 uv run --directory service python -m app.tui
 
-Keys: n next page, p previous page, r reset to first page, R refresh current
+Keys: n next page, p previous page, r reset to first page, f refresh current
 page in place, q quit.
 Tab into the label/status selects to filter; changing either resets to page 1.
 The app polls GET /stats every EDITS_TUI_POLL_SECONDS (default 5, <=0 turns it
@@ -102,7 +102,7 @@ class EditsBrowser(App):
         ("n", "next_page", "Next page"),
         ("p", "prev_page", "Previous page"),
         ("r", "reset", "First page"),
-        ("R", "refresh", "Refresh"),
+        ("f", "refresh", "Refresh"),
         ("q", "quit", "Quit"),
     ]
 
@@ -212,7 +212,7 @@ class EditsBrowser(App):
         nav = f"prev={prev_flag} next={next_flag}"
         text = f"{filters}  |  {self.row_count} rows  |  {nav}"
         if self.new_edits_available:
-            text += "  |  [yellow]new edits — R to refresh[/yellow]"
+            text += "  |  [yellow]new edits — f to refresh[/yellow]"
         self.query_one("#status_line", Static).update(text)
 
     @work(exclusive=True, group="stats")
