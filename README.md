@@ -52,7 +52,9 @@ Watch it classify:
 docker compose logs -f worker
 ```
 
-Query results:
+### Query results
+
+#### CURL
 
 ```sh
 curl "http://localhost:8000/edits?label=vandalism"
@@ -67,22 +69,20 @@ curl "http://localhost:8000/stats"
 # {"total": ..., "by_label": {...}, "by_status": {...}} — label/status counts
 ```
 
-Browse `/edits` interactively instead of hand-copying cursors:
+#### Browse `/edits` interactively instead of hand-copying cursors:
 
 ```sh
-uv run --directory service edits-tui
 # EDITS_API_URL=http://localhost:8000 (default) — override if the API is elsewhere
-# n next page, p previous page, r reset, arrow keys scroll the table's columns
-# (free-text columns are last) — enter on a row shows the full record
+uv run --directory service edits-tui
 ```
 
 ## Development
 
 ```sh
 uv run pytest                              # unit tests, no network/Docker
-uv run pytest -m "integration"             # + Redpanda/Postgres/Ollama via testcontainers
+uv run pytest -m "integration"             # Integration testing w/ Redpanda/Postgres/Ollama via testcontainers
 uv run ruff check . --fix && uv run ruff format # lint & format
-uv run ty check service/app                # type check (scoped: test tier uses fakes on purpose)
+uv run ty check service/app                # type check
 uv run --directory service mutmut run      # mutation testing (~30s)
 ```
 
@@ -134,3 +134,4 @@ Other issues worth noting:
 - **Cost control**: Filtering happens before the topic (~50 events/sec down to a few/sec via enwiki, namespace 0, `type=edit`, `bot=false`), `max_tokens=256` caps responses, and the second-pass prompt only fires below the confidence threshold. If enwiki spikes, consumer lag grows instead of spend scaling per-event.
 - **LLM prompt injection**: No explicit protection exists beyond a rudimentary guard wrapping text in `<<>>` — no dangerous-pattern detection or human-in-the-loop controls. A production system would apply techniques from the [OWASP LLM Prompt Injection Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/LLM_Prompt_Injection_Prevention_Cheat_Sheet.html#primary-defenses). Acceptable for this exercise's scope, but worth flagging.
 - **Observability / Metrics**: The stack lacks proper observability (Prometheus + Grafana would suffice) to track application health (consumer lag [regular & dead-letter-topics], transient errors, crash loops, etc. are all invisible). The only insight available is a `/stats` endpoint showing event counts and their labels/status.
+- **Missing CI/CD**: In a real production repository, we'd set up a whole ci/cd suite to assist with testing, style guides, approval gates, lastly deploying to real environments.
