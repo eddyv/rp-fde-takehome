@@ -248,6 +248,7 @@ from kafka import KafkaProducer
 from kafka.errors import KafkaError
 
 WITH_FIX = "--with-fix" in sys.argv
+NO_IDEMPOTENCE = "--no-idempotence" in sys.argv
 
 if WITH_FIX:
     # The proposed kafka-python fix, applied as a runtime patch: an
@@ -270,13 +271,24 @@ if WITH_FIX:
 print("=" * 74)
 if WITH_FIX:
     print(" FIX DEMO: same collision, patched client (null-key lookup guarded)")
+elif NO_IDEMPOTENCE:
+    print(" WORKAROUND DEMO: same startup, enable_idempotence=False")
 else:
     print(" REPRODUCTION: the `socket disconnected` poison loop")
 print(" kafka-python idempotent producer  x  Redpanda lazy id_allocator init")
 print("=" * 74)
 
 bug_file, bug_line, bug_src = find_bug_line()
-print(f"""
+if NO_IDEMPOTENCE:
+    print("""
+Same fresh broker, same barrier relay — but the producers are created with
+enable_idempotence=False, so they never request a producer id. Stage 1 of
+the causal chain (the concurrent first-ever InitProducerId collision) has
+nothing to collide, and the loop never starts. This demonstrates the
+config-only workaround; the real fix is the client patch (--with-fix).
+""", flush=True)
+else:
+    print(f"""
 The chain this run demonstrates, live:
 
   1. TRIGGER   {N_PRODUCERS} producers send their first-ever InitProducerId to a fresh
@@ -322,20 +334,28 @@ print(f"  kafka-python {kafka.__version__} "
       f"({os.path.dirname(kafka.__file__)})")
 print(f"  broker (fresh, id_allocator never initialized): {UPSTREAM}")
 print(f"  barrier relay: {RELAY_HOST}:{RELAY_PORT} -> {UPSTREAM}")
-print(f"  creating {N_PRODUCERS} idempotent producers (transactional_id=None)...",
-      flush=True)
+if NO_IDEMPOTENCE:
+    print(f"  creating {N_PRODUCERS} producers with enable_idempotence=False...",
+          flush=True)
+else:
+    print(f"  creating {N_PRODUCERS} idempotent producers (transactional_id=None)...",
+          flush=True)
 
 producers = [None] * N_PRODUCERS
+
+PRODUCER_CONFIG = dict(
+    bootstrap_servers=[f"{RELAY_HOST}:{RELAY_PORT}"],
+    acks="all", retries=5,
+)
+if NO_IDEMPOTENCE:
+    PRODUCER_CONFIG["enable_idempotence"] = False
 
 
 def make(i):
     end = time.time() + 30
     while time.time() < end:
         try:
-            producers[i] = KafkaProducer(
-                bootstrap_servers=[f"{RELAY_HOST}:{RELAY_PORT}"],
-                acks="all", retries=5,
-            )
+            producers[i] = KafkaProducer(**PRODUCER_CONFIG)
             return
         except KafkaError:
             time.sleep(0.05)
@@ -347,10 +367,19 @@ for t in threads:
     t.start()
 for t in threads:
     t.join()
-relay.release.wait(timeout=15)
-T0 = relay.released_at or time.time()
-print(f"  all {relay.parked} InitProducerId frames parked at the barrier and "
-      f"released together\n  observing for {OBSERVE_S}s...", flush=True)
+if NO_IDEMPOTENCE:
+    # no InitProducerId is ever sent, so the barrier can't fill — give the
+    # startup the same collision window, then just observe
+    relay.release.wait(timeout=BARRIER_TIMEOUT_S)
+    T0 = relay.released_at or time.time()
+    print(f"  {relay.parked} InitProducerId frames reached the barrier "
+          f"(idempotency off — expected 0)\n  observing for {OBSERVE_S}s...",
+          flush=True)
+else:
+    relay.release.wait(timeout=15)
+    T0 = relay.released_at or time.time()
+    print(f"  all {relay.parked} InitProducerId frames parked at the barrier and "
+          f"released together\n  observing for {OBSERVE_S}s...", flush=True)
 time.sleep(OBSERVE_S)
 
 # ---------------------------- narrate ---------------------------------------
@@ -361,9 +390,47 @@ victims = [(t, p, d) for t, p, k, d in resps if d[1] in (15, 16)]
 enqueues = recorder.by_kind("poison_enqueue")
 wire_sends = recorder.by_kind("poison_wire")
 disconnects = [e for e in recorder.by_kind("disconnect") if e[0] >= T0]
+sent = recorder.by_kind("init_sent")
+
+if NO_IDEMPOTENCE:
+    stage(2, "nothing to collide — no InitProducerId was ever sent")
+    print(f"  InitProducerId requests sent: {len(sent)}")
+    print(f"  null-key FindCoordinator enqueued: {len(enqueues)}")
+    print(f"  `socket disconnected` events: {len(disconnects)}")
+    print("""  WHY: the trigger needs concurrent first-ever InitProducerId requests.
+  With enable_idempotence=False the producer skips producer-id allocation
+  entirely, so the fast-fail -> null-key lookup -> slam loop has no entry
+  point — even against a fresh broker with an uninitialized id_allocator.""")
+
+    stage(3, "producers still deliver — the workaround holds")
+    delivered = 0
+    for i, prod in enumerate(producers):
+        if prod is None:
+            print(f"  producer-{i}: never constructed (see log)")
+            continue
+        try:
+            md = prod.send("wedge-noidem-probe", b"ping").get(timeout=10)
+            delivered += 1
+            print(f"  producer-{i}: delivered to "
+                  f"{md.topic}[{md.partition}]@{md.offset}")
+        except KafkaError as e:
+            print(f"  producer-{i}: send FAILED: {e!r}")
+    print("""  TRADE-OFF: without idempotence a retried produce can be written twice
+  (duplicates on broker-side retry). Acceptable as a config-only stopgap;
+  the real fix is the client patch (--with-fix).""")
+
+    healthy = (not sent and not enqueues and len(disconnects) < 20
+               and delivered == N_PRODUCERS)
+    print("\n" + "=" * 74)
+    print(f" VERDICT: {'WORKAROUND VERIFIED' if healthy else 'UNEXPECTED — see log'} — "
+          f"{len(sent)} InitProducerIds, {len(enqueues)} poison lookups, "
+          f"{len(disconnects)} disconnects, "
+          f"{delivered}/{N_PRODUCERS} test sends delivered")
+    print(f" full client DEBUG log: {LOG_PATH}")
+    print("=" * 74, flush=True)
+    os._exit(0 if healthy else 1)
 
 stage(2, "the trigger — one creation, concurrent fast-fails")
-sent = recorder.by_kind("init_sent")
 if sent:
     ts = [t for t, _, _, _ in sent[:N_PRODUCERS]]
     print(f"  {len(sent[:N_PRODUCERS])} InitProducerIds hit the broker within "
