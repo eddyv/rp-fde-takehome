@@ -68,10 +68,24 @@ INFO  raft - [{kafka_internal/id_allocator/0}] consensus.cc:1485 - Starting ... 
 ~330 ms first-call latency is the create-topic + raft-election window.
 The concurrency requirement was measured with a raw-socket blast of 40
 simultaneous frames: exactly 1 success + 39 × error 16, while arrivals 6+ ms
-apart all succeed. (Which exact broker branch fast-fails the concurrent
-requests is not mapped; only this observable contract is claimed.) This is
-why the bug requires concurrent producer startup, and why it looks random:
-docker compose starts worker + retrier at the same instant, and whichever
+apart all succeed.*
+
+*The fast-fail branch is visible in the broker log. In a 6-producer
+collision, all six requests log the `can't find` WARN and all six attempt
+the topic create; 2 ms later the five losers of the create race each log*
+
+```
+WARN cluster - id_allocator_frontend.cc:246 - can not create kafka_internal/id_allocator topic - error: The topic has already exists
+```
+
+*— exactly one line per fast-failed producer (5 = the 5 wedged clients).
+The winner's create succeeds and its request waits for the raft election;
+the losers' create returns "already exists" and the frontend answers
+`COORDINATOR_NOT_AVAILABLE` immediately instead of waiting. That asymmetry
+is also why arrivals 6+ ms later are safe: by then the topic is in the
+metadata cache, so they never enter the create-race branch. This is why the
+bug requires concurrent producer startup, and why it looks random: docker
+compose starts worker + retrier at the same instant, and whichever
 producer's request lands concurrent-but-second loses.*
 
 **2. Root cause — kafka-python's null-key coordinator lookup.**
@@ -275,6 +289,12 @@ this diagnosable from the broker log alone.
   364 ms after the WARN. Allocator persistence across restarts:
   `id_allocator_batch_size:1000` (boot config dump) and a post-restart
   producer receiving id 1001.
+- Fast-fail branch (per-victim broker log signature): in a 6-producer
+  collision, 6 × `id_allocator_frontend.cc:269` "can't find" WARNs and
+  6 × topic creates at T, then 5 × `id_allocator_frontend.cc:246`
+  "can not create ... The topic has already exists" WARNs at T+2 ms —
+  one per fast-failed producer, matching the 5 wedged clients and the
+  5 client-side error-16 responses 1:1.
 - Disconnect causality controls: `--with-fix` (error-16 responses present,
   null lookup guarded → no disconnect loop) and `wedge-poison-direct.py`
   (bare null-key frame, no `InitProducerId` → immediate disconnect).
