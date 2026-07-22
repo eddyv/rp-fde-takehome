@@ -119,6 +119,31 @@ one-shot per cluster), the in-flight envelope is redelivered, and the
 retry → DLQ arc completes. Cost: log spam plus one crash/restart cycle and
 ~60 s of added latency on the first post-wedge publish.
 
+## Why consumers are unaffected
+
+Consumers also call `FindCoordinator`, but the null-key frame is unreachable
+from their side. kafka-python has exactly three `FindCoordinator` call sites:
+
+| Call site | Key | Can the key be null? |
+|---|---|---|
+| `producer/transaction_manager.py:1075` (the bug) | `transactional_id` | **Yes** — it is `None` by definition for idempotent-only producers |
+| `coordinator/base.py:826` (consumer group lookup) | `group_id` | No — a consumer without a group id runs no group coordination at all, so the request is never sent |
+| `admin/client.py` (AdminClient) | caller-supplied group ids | No (and unused by this service) |
+
+Both frames appear side-by-side in the captured evidence: consumers sent
+`FindCoordinatorRequest(key_type=0, coordinator_keys=['reasoning-service-retrier'])`
+— valid, answered instantly — while the wedged producer sent
+`coordinator_keys=[None]`. The original incident is itself the strongest
+proof: the wedged retrier's consumer joined its group, fetched envelopes, and
+committed offsets normally the whole time the producer client in the same
+process looped.
+
+Consumers even hit the same class of retriable coordinator errors at fresh
+boot (`COORDINATOR_NOT_AVAILABLE` while the group coordinator initializes)
+and handle it correctly: they retry the *same valid request* until it
+succeeds. The producer path is broken precisely because its error handler
+does not retry the failed request — it fabricates a different, invalid one.
+
 ## Exposure beyond first boot
 
 The loop is entered by any *fast* retriable coordinator-error response to
