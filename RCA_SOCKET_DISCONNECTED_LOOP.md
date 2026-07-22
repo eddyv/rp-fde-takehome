@@ -48,15 +48,31 @@ end-to-end; one-line service mitigation available today.
 Five links, each observed directly (evidence in italics).
 
 **1. Trigger — concurrent first-ever `InitProducerId` on a fresh cluster.**
-Redpanda creates its `id_allocator` internal state lazily when the first
-`InitProducerId` arrives; that request waits ~330 ms and succeeds. Requests
-arriving *concurrently* (same reactor batch, sub-millisecond) fast-fail in
-~5 ms with retriable `COORDINATOR_NOT_AVAILABLE` (error_code=16). Requests
-even 6 ms later wait politely and succeed.
-*A raw-socket blast of 40 simultaneous frames yields exactly 1 success +
-39 × error 16. This is why the bug needs services booting together, and why
-it looks random: docker compose starts worker + retrier at the same instant,
-and whichever producer's request lands concurrent-but-second loses.*
+Redpanda creates its `kafka_internal/id_allocator` topic lazily when the
+first `InitProducerId` arrives; that request waits ~330 ms and succeeds.
+Requests arriving concurrently (sub-millisecond) fast-fail in ~5 ms with
+retriable `COORDINATOR_NOT_AVAILABLE` (error_code=16). Requests even 6 ms
+later wait politely and succeed.
+*Lazy creation observed directly: on a fresh broker,
+`rpk cluster partitions list --all` shows no partitions and the broker log
+never mentions id_allocator — until the instant the first `InitProducerId`
+arrives, when the broker logs*
+
+```
+WARN  cluster - id_allocator_frontend.cc:269 - can't find {kafka_internal/id_allocator} in the metadata cache
+INFO  cluster - topics_frontend.cc:376 - Create topics [{kafka_internal/id_allocator} ...]
+INFO  raft - [{kafka_internal/id_allocator/0}] consensus.cc:1485 - Starting ... term 0 initial_state true
+```
+
+*and the client's success lands 364 ms after the "can't find" line — the
+~330 ms first-call latency is the create-topic + raft-election window.
+The concurrency requirement was measured with a raw-socket blast of 40
+simultaneous frames: exactly 1 success + 39 × error 16, while arrivals 6+ ms
+apart all succeed. (Which exact broker branch fast-fails the concurrent
+requests is not mapped; only this observable contract is claimed.) This is
+why the bug requires concurrent producer startup, and why it looks random:
+docker compose starts worker + retrier at the same instant, and whichever
+producer's request lands concurrent-but-second loses.*
 
 **2. Root cause — kafka-python's null-key coordinator lookup.**
 On `NOT_COORDINATOR` / `COORDINATOR_NOT_AVAILABLE`,
@@ -97,7 +113,13 @@ retries every ~100 ms forever. `FindCoordinator` has queue priority 0, so the
 stays `-1`, the producer's metadata refreshes die on the same connection
 (`Metadata refresh: failed`), and the ERROR spam continues until the process
 dies. *Measured: 239 client disconnects vs 243 broker parse-slams over one
-6 s window — one per loop iteration, ~8/s per wedged producer.*
+6 s window — one per loop iteration, ~8/s per wedged producer. The
+disconnects are caused by the `FindCoordinator` frames, not by
+`InitProducerId`: in the `--with-fix` control the identical collision still
+produces the error-16 responses but zero disconnects (a failed
+`InitProducerId` is a well-formed response on a healthy connection), and
+conversely `wedge-poison-direct.py` triggers the disconnect with a single
+bare `FindCoordinator` frame and no `InitProducerId` anywhere.*
 
 ## Why it looked like "retrier vs worker"
 
@@ -114,8 +136,12 @@ wedge only matters on the first publish: `send().get(timeout=30)` can never
 complete (no producer id, no metadata), the service raises
 `KafkaTimeoutError`, and the process crashes **uncommitted** — which is the
 service's designed failure mode. `restart: unless-stopped` respawns it, the
-fresh producer initializes against the now-warm broker (the window is
-one-shot per cluster), the in-flight envelope is redelivered, and the
+fresh producer initializes against the now-warm broker (the *lazy-creation*
+window is one-shot: allocator state persists across broker restarts — ids
+are handed out in blocks of `id_allocator_batch_size:1000`, and a
+post-restart producer observably received id 1001; see "Exposure beyond
+first boot" for windows other than creation), the in-flight envelope is
+redelivered, and the
 retry → DLQ arc completes. Cost: log spam plus one crash/restart cycle and
 ~60 s of added latency on the first post-wedge publish.
 
@@ -240,3 +266,15 @@ this diagnosable from the broker log alone.
   `on_complete` disconnect handling (~:856) + `Priority.FIND_COORDINATOR = 0`.
 - Redpanda slam: broker log `connection_context.cc:1116`, one line per loop
   iteration, count matches client-side disconnect count.
+- Lazy `id_allocator` creation: before any producer,
+  `rpk cluster partitions list --all` is empty and the broker log has zero
+  id_allocator mentions; at the first `InitProducerId` the broker logs the
+  `id_allocator_frontend.cc:269` "can't find ... in the metadata cache" WARN,
+  the `topics_frontend.cc:376` create, and the raft-group bootstrap for
+  `{kafka_internal/id_allocator/0}`; the client's `ProducerId set to 1` lands
+  364 ms after the WARN. Allocator persistence across restarts:
+  `id_allocator_batch_size:1000` (boot config dump) and a post-restart
+  producer receiving id 1001.
+- Disconnect causality controls: `--with-fix` (error-16 responses present,
+  null lookup guarded → no disconnect loop) and `wedge-poison-direct.py`
+  (bare null-key frame, no `InitProducerId` → immediate disconnect).
